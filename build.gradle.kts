@@ -116,3 +116,16 @@ tasks.register("packageApp") {
         }
     }
 }
+
+tasks.register<Zip>("releaseZip") {
+    group = "distribution"
+    description = "Zips the standalone app for sharing."
+    dependsOn("packageApp")
+
+    from(layout.buildDirectory.dir("app"))
+    archiveBaseName = "ProcessingCLI"
+    archiveVersion = project.version.toString()
+    archiveClassifier = "windows-x64"
+    destinationDirectory = layout.buildDirectory.dir("distributions")
+    isZip64 = true
+}
