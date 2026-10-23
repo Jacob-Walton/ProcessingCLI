@@ -4,6 +4,7 @@ import processing.core.PApplet;
 
 import javax.tools.JavaCompiler;
 import javax.tools.ToolProvider;
+import java.io.File;
 import java.io.IOException;
 import java.net.URL;
 import java.net.URLClassLoader;
@@ -15,8 +16,11 @@ import java.nio.file.attribute.FileTime;
 import java.security.MessageDigest;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HexFormat;
+import java.util.List;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 public class Runner {
@@ -30,8 +34,12 @@ public class Runner {
         return CACHE_ROOT.resolve(hash(key));
     }
 
-    public static String stamp(String sketchName, String source) throws Exception {
-        return hash(sketchName + "\n" + toolStamp() + "\n" + source);
+    public static String stamp(String sketchName, String source, List<Path> libs) throws Exception {
+        StringBuilder sb = new StringBuilder(sketchName).append('\n').append(toolStamp()).append('\n');
+        for (Path jar : libs) {
+            sb.append(jar).append('@').append(Files.getLastModifiedTime(jar)).append('\n');
+        }
+        return hash(sb.append(source).toString());
     }
 
     public static boolean isCompiled(Path classesDir, String stamp) {
@@ -42,7 +50,7 @@ public class Runner {
         }
     }
 
-    public static void compile(String className, String javaSource, Path classesDir, String stamp) throws Exception {
+    public static void compile(String className, String javaSource, Path classesDir, String stamp, List<Path> libs) throws Exception {
         deleteRecursively(classesDir);
         Files.createDirectories(classesDir);
         Path file = classesDir.resolve(className + ".java");
@@ -52,8 +60,14 @@ public class Runner {
         if (compiler == null) {
             throw new IllegalStateException("No Java compiler available: run this with a JDK, not a JRE");
         }
+
+        String classpath = Stream.concat(
+                        Stream.of(System.getProperty("java.class.path")),
+                        libs.stream().map(Path::toString))
+                .collect(Collectors.joining(File.pathSeparator));
+
         int result = compiler.run(null, null, null,
-                "-cp", System.getProperty("java.class.path"),
+                "-cp", classpath,
                 "-d", classesDir.toString(),
                 "-proc:none",
                 "-implicit:none",
@@ -65,13 +79,15 @@ public class Runner {
         Files.writeString(classesDir.resolve(".ok"), stamp);
     }
 
-    public static void launch(String className, Path classesDir, Path sketchDir) throws Exception {
-        // Mark as recently used
+    public static void launch(String className, Path classesDir, Path sketchDir, List<Path> libs) throws Exception {
         Files.setLastModifiedTime(classesDir.resolve(".ok"), FileTime.from(Instant.now()));
 
-        // Left open on purpose
-        URLClassLoader loader = new URLClassLoader(
-                new URL[]{classesDir.toUri().toURL()}, Runner.class.getClassLoader());
+        List<URL> urls = new ArrayList<>();
+        urls.add(classesDir.toUri().toURL());
+        for (Path jar : libs) urls.add(jar.toUri().toURL());
+        URLClassLoader loader = new URLClassLoader(urls.toArray(URL[]::new), Runner.class.getClassLoader());
+        Thread.currentThread().setContextClassLoader(loader);
+
         PApplet sketch = (PApplet) loader.loadClass(className).getDeclaredConstructor().newInstance();
         if (Bench.ENABLED) {
             sketch.registerMethod("post", new Bench.FirstFrame());

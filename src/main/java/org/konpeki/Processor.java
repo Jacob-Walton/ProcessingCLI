@@ -2,6 +2,7 @@ package org.konpeki;
 
 import processing.mode.java.preproc.PdePreprocessor;
 
+import javax.lang.model.SourceVersion;
 import java.io.IOException;
 import java.io.StringWriter;
 import java.nio.file.Files;
@@ -38,7 +39,14 @@ public class Processor {
     }
 
     public String sketchName() {
-        return dir.getFileName().toString();
+        String raw = dir.getFileName().toString();
+        StringBuilder sb = new StringBuilder();
+        raw.codePoints().forEach(cp -> sb.appendCodePoint(Character.isJavaIdentifierPart(cp) ? cp : '_'));
+        if (sb.isEmpty() || !Character.isJavaIdentifierStart(sb.codePointAt(0))) {
+            sb.insert(0, '_');
+        }
+        String name = sb.toString();
+        return SourceVersion.isName(name) ? name : name + "_";
     }
 
     public String source() throws IOException {
