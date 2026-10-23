@@ -68,6 +68,8 @@ tasks.register<Exec>("packageApp") {
         "--main-class", "org.konpeki.Main",
         "--add-modules", allModules,
         "--win-console",
+        "--jlink-options", "--strip-debug --no-man-pages --no-header-files --generate-cds-archive",
+        "--java-options", "-XX:+AutoCreateSharedArchive -XX:SharedArchiveFile=\$APPDIR/processingcli.jsa -Xlog:cds=off",
         "--dest", out.absolutePath
     )
 }

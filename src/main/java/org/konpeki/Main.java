@@ -10,12 +10,25 @@ public class Main {
             System.exit(1);
         }
 
+        // Warm up AWT + Processing
+        Thread.ofPlatform().daemon().start(() -> {
+            try {
+                java.awt.Toolkit.getDefaultToolkit();
+                Class.forName("processing.core.PApplet");
+            } catch (Throwable ignored) {}
+        });
+
         Path dir = Path.of(args[0]);
         Processor processor = new Processor(dir);
+        String name = processor.sketchName();
 
         try {
-            String code = processor.process();
-            Runner.run(processor.sketchName(), code, dir);
+            String source = processor.source();
+            Path classes = Runner.cacheDir(name, source);
+            if (!Runner.isCompiled(classes)) {
+                Runner.compile(name, processor.process(source), classes);
+            }
+            Runner.launch(name, classes, dir);
         } catch (SketchException e) {
             System.err.println("Sketch error: " + e.getMessage());
             System.exit(1);
