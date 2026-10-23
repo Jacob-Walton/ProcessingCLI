@@ -1,3 +1,4 @@
+import org.apache.tools.ant.types.resources.Archives
 import java.lang.module.ModuleFinder
 
 plugins {
@@ -32,16 +33,24 @@ tasks.test {
     useJUnitPlatform()
 }
 
+interface InjectedOps {
+    @get:Inject val archives: ArchiveOperations
+    @get:Inject val fs: FileSystemOperations
+}
+val ops = objects.newInstance<InjectedOps>()
+val archives = ops.archives
+val fs = ops.fs
+
 tasks.register<Jar>("fatJar") {
     group = "build"
     archiveClassifier = "all"
     manifest { attributes["Main-Class"] = "org.konpeki.Main" }
+    val zips = archives
+
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
     from(sourceSets.main.get().output)
-    from({
-        configurations.runtimeClasspath.get()
-            .filter { it.name.endsWith(".jar") }
-            .map { zipTree(it) }
+    from(configurations.runtimeClasspath.map { cp ->
+        cp.filter { it.name.endsWith(".jar") }.map { zips.zipTree(it) }
     })
     exclude("META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA")
 }
@@ -51,6 +60,7 @@ tasks.register<Exec>("packageApp") {
     dependsOn("fatJar")
     val jar = tasks.named<Jar>("fatJar").get().archiveFile.get().asFile
     val out = layout.buildDirectory.dir("app").get().asFile
+    val fileOps = fs
 
     val allModules = ModuleFinder.ofSystem().findAll()
         .map { it.descriptor().name() }
@@ -58,7 +68,13 @@ tasks.register<Exec>("packageApp") {
         .sorted()
         .joinToString(",")
 
-    doFirst { delete(out) }
+    inputs.file(jar)
+    inputs.property("modules", allModules)
+    outputs.dir(out)
+
+    doFirst { fileOps.delete {
+        delete(out)
+    } }
     commandLine(
         "${System.getProperty("java.home")}/bin/jpackage",
         "--type", "app-image",
@@ -67,9 +83,9 @@ tasks.register<Exec>("packageApp") {
         "--main-jar", jar.name,
         "--main-class", "org.konpeki.Main",
         "--add-modules", allModules,
-        "--win-console",
         "--jlink-options", "--strip-debug --no-man-pages --no-header-files --generate-cds-archive",
         "--java-options", "-XX:+AutoCreateSharedArchive -XX:SharedArchiveFile=\$APPDIR/processingcli.jsa -Xlog:cds=off",
+        "--win-console",
         "--dest", out.absolutePath
     )
 }
