@@ -1,14 +1,13 @@
 package org.konpeki;
 
-import processing.mode.java.preproc.PdePreprocessor;
-
-import javax.lang.model.SourceVersion;
 import java.io.IOException;
 import java.io.StringWriter;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.stream.Stream;
+import javax.lang.model.SourceVersion;
+import processing.mode.java.preproc.PdePreprocessor;
 
 /**
  * Pre-process a .pde file.
@@ -17,7 +16,6 @@ public class Processor {
     private final Path dir;
     private final Path mainFile;
     private final List<Path> paths;
-
 
     public Processor(Path dir) throws IOException {
         if (!Files.isDirectory(dir)) {
@@ -32,9 +30,10 @@ public class Processor {
 
         try (Stream<Path> s = Files.list(dir)) {
             this.paths = Stream.concat(
-                    Stream.of(mainFile),
-                    s.filter(p -> p.toString().endsWith(".pde") && !p.equals(mainFile)).sorted()
-            ).toList();
+                            Stream.of(mainFile),
+                            s.filter(p -> p.toString().endsWith(".pde") && !p.equals(mainFile))
+                                    .sorted())
+                    .toList();
         }
     }
 

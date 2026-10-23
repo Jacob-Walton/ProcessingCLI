@@ -4,12 +4,25 @@ import java.time.Duration;
 import java.time.Instant;
 
 public class Bench {
-    public static final boolean ENABLED = System.getenv("PCLI_BENCH") != null;
-    private static final Instant START = ProcessHandle.current().info().startInstant().orElse(Instant.now());
+    private static final Instant START =
+            ProcessHandle.current().info().startInstant().orElse(Instant.now());
+
+    private static boolean enabled = System.getenv("PCLI_BENCH") != null;
+
+    public static void enable() {
+        enabled = true;
+    }
+
+    public static boolean enabled() {
+        return enabled;
+    }
 
     public static void mark(String label) {
-        if (ENABLED)
-            System.err.printf("%-12s %6d ms%n", label, Duration.between(START, Instant.now()).toMillis());
+        if (enabled) {
+            System.err.printf(
+                    "%-12s %6d ms%n",
+                    label, Duration.between(START, Instant.now()).toMillis());
+        }
     }
 
     public static final class FirstFrame {

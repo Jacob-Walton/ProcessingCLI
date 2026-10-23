@@ -1,14 +1,29 @@
 import org.apache.tools.ant.types.resources.Archives
 import java.lang.module.ModuleFinder
+import java.io.ByteArrayOutputStream
 
 plugins {
     id("java")
+    id("com.diffplug.spotless") version "8.5.1"
     application
+}
+
+spotless {
+    java {
+        palantirJavaFormat()
+        removeUnusedImports()
+    }
 }
 
 group = "org.konpeki"
 version = "1.0-SNAPSHOT"
 val processingVersion = "4.5.7"
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(25)
+    }
+}
 
 repositories {
     mavenCentral()
@@ -26,15 +41,23 @@ dependencies {
         exclude(group = "org.processing", module = "utils")
     }
     implementation(files("libs/processing-utils-4.5.7.jar"))
+    implementation("info.picocli:picocli:4.7.7")
 }
 
 application {
     mainClass = "org.konpeki.Main"
 }
 
+tasks.compileJava {
+    dependsOn(tasks.spotlessApply)
+}
+
 tasks.test {
     useJUnitPlatform()
 }
+
+tasks.named("distZip") { enabled = false }
+tasks.named("distTar") { enabled = false }
 
 interface InjectedOps {
     @get:Inject val archives: ArchiveOperations
@@ -67,27 +90,33 @@ tasks.register("packageApp") {
     val out = layout.buildDirectory.dir("app").get().asFile
     val trainingSketch = layout.projectDirectory.dir("training/Training").asFile
     val trainingCache = layout.buildDirectory.dir("aot-training").get().asFile
-    val javaHome = System.getProperty("java.home")
+    val jdk = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(25) }
+        .get().metadata.installationPath.asFile.absolutePath
     val fileOps = fs
     val exec = execOps
 
-    val allModules = ModuleFinder.ofSystem().findAll()
-        .map { it.descriptor().name() }
-        .filterNot { it.startsWith("jdk.incubator") }
-        .sorted()
-        .joinToString(",")
-
     inputs.file(jar)
     inputs.dir(trainingSketch)
-    inputs.property("modules", allModules)
+    inputs.property("jdk", jdk)
     outputs.dir(out)
 
     doLast {
         fileOps.delete { delete(out, trainingCache) }
 
+        // Every module in the toolchain JDK (not Gradle's own JVM)
+        val listing = ByteArrayOutputStream()
+        exec.exec {
+            commandLine("$jdk/bin/java", "--list-modules")
+            standardOutput = listing
+        }
+        val allModules = listing.toString().lines()
+            .map { it.substringBefore('@').trim() }
+            .filter { it.isNotEmpty() && !it.startsWith("jdk.incubator") }
+            .joinToString(",")
+
         exec.exec {
             commandLine(
-                "$javaHome/bin/jpackage",
+                "$jdk/bin/jpackage",
                 "--type", "app-image",
                 "--name", "ProcessingCLI",
                 "--input", jar.parent,
@@ -109,6 +138,7 @@ tasks.register("packageApp") {
                 "-Xlog:all=error",
                 "-cp", File(appDir, jar.name).absolutePath,
                 "org.konpeki.Main",
+                "--bench",
                 trainingSketch.absolutePath
             )
             environment("PCLI_BENCH", "1")

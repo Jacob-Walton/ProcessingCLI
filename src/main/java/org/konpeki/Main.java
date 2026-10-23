@@ -1,39 +1,92 @@
 package org.konpeki;
 
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
-
+import java.util.concurrent.Callable;
+import picocli.CommandLine;
+import picocli.CommandLine.Command;
+import picocli.CommandLine.Option;
+import picocli.CommandLine.Parameters;
 import processing.utils.SketchException;
 
-public class Main {
-    static void main(String[] args) throws Exception {
-        Bench.mark("main");
+@Command(
+        name = "ProcessingCLI",
+        mixinStandardHelpOptions = true,
+        version = "ProcessingCLI 1.0",
+        description = "Preprocesses, compiles, and runs a Processing sketch.")
+public class Main implements Callable<Integer> {
 
-        if (args.length != 1) {
-            System.out.printf("Expected 1 arg, got %d arg(s)", args.length);
-            System.exit(1);
-        }
+    @Parameters(index = "0", paramLabel = "SKETCH", description = "Sketch folder (must contain <folder name>.pde).")
+    Path sketch;
 
+    @Parameters(
+            index = "1..*",
+            paramLabel = "ARGS",
+            description = "Arguments passed to the sketch (its args[]). Put -- before any that start with '-'.")
+    List<String> sketchArgs = new ArrayList<>();
+
+    @Option(names = "--present", description = "Run full screen.")
+    boolean present;
+
+    @Option(names = "--emit-java", description = "Print the preprocessed Java source and exit.")
+    boolean emitJava;
+
+    @Option(names = "--no-cache", description = "Recompile even if a cached build exists.")
+    boolean noCache;
+
+    @Option(
+            names = "--sketchbook",
+            paramLabel = "DIR",
+            description = "Sketchbook folder for contributed libraries (default: Processing's own setting).")
+    Path sketchbook;
+
+    @Option(names = "--bench", description = "Print startup timings and exit after the first frame.")
+    boolean bench;
+
+    private boolean launched;
+
+    static void main(String[] args) {
         // Warm up AWT + Processing
         Thread.ofPlatform().daemon().start(() -> {
             try {
                 java.awt.Toolkit.getDefaultToolkit();
                 Class.forName("processing.core.PApplet");
-            } catch (Throwable ignored) {}
+            } catch (Throwable ignored) {
+            }
         });
+
+        Main app = new Main();
+        int code = new CommandLine(app).execute(args);
+
+        // On a successful launch, leave the JVM running for the sketch window
+        if (code != 0 || !app.launched) {
+            System.exit(code);
+        }
+    }
+
+    @Override
+    public Integer call() throws Exception {
+        if (bench) Bench.enable();
+        Bench.mark("main");
 
         Runner.cleanUpInBackground();
 
-        Path dir = Path.of(args[0]);
-        Processor processor = new Processor(dir);
+        Processor processor = new Processor(sketch);
         String name = processor.sketchName();
 
         try {
             String source = processor.source();
-            List<Path> libs = Libraries.forSketch(dir, source);
-            Path classes = Runner.cacheDir(dir);
+
+            if (emitJava) {
+                System.out.println(processor.process(source));
+                return 0;
+            }
+
+            List<Path> libs = Libraries.forSketch(sketch, source, sketchbook);
+            Path classes = Runner.cacheDir(sketch);
             String stamp = Runner.stamp(name, source, libs);
-            if (!Runner.isCompiled(classes, stamp)) {
+            if (noCache || !Runner.isCompiled(classes, stamp)) {
                 String code = processor.process(source);
                 Bench.mark("processed");
                 Runner.compile(name, code, classes, stamp, libs);
@@ -41,11 +94,17 @@ public class Main {
             } else {
                 Bench.mark("cache-hit");
             }
-            Runner.launch(name, classes, dir, libs);
+
+            Runner.launch(name, classes, sketch, libs, present, sketchArgs);
             Bench.mark("launched");
+            launched = true;
+            return 0;
         } catch (SketchException e) {
             System.err.println("Sketch error: " + e.getMessage());
-            System.exit(1);
+            return 1;
+        } catch (IllegalStateException e) {
+            System.err.println(e.getMessage());
+            return 1;
         }
     }
 }

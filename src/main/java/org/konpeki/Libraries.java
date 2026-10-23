@@ -12,19 +12,24 @@ import java.util.stream.Stream;
 import java.util.zip.ZipEntry;
 
 public final class Libraries {
-    private static final Pattern IMPORT = Pattern.compile(
-            "^\\s*import\\s+(?:static\\s+)?([\\w.]+?)(\\.\\*)?\\s*;", Pattern.MULTILINE);
+    private static final Pattern IMPORT =
+            Pattern.compile("^\\s*import\\s+(?:static\\s+)?([\\w.]+?)(\\.\\*)?\\s*;", Pattern.MULTILINE);
 
     // Already available without any library
     private static final List<String> BUILT_IN = List.of(
-            "java.", "javax.", "processing.core", "processing.data",
-            "processing.event", "processing.opengl", "processing.awt");
+            "java.",
+            "javax.",
+            "processing.core",
+            "processing.data",
+            "processing.event",
+            "processing.opengl",
+            "processing.awt");
 
-    public static List<Path> forSketch(Path sketchDir, String source) throws IOException {
+    public static List<Path> forSketch(Path sketchDir, String source, Path sketchbookOverride) throws IOException {
         Set<Path> jars = new LinkedHashSet<>(jarsIn(sketchDir.resolve("code")));
 
         Set<String> wanted = importedPackages(source);
-        Path libsDir = sketchbook().resolve("libraries");
+        Path libsDir = (sketchbookOverride != null ? sketchbookOverride : sketchbook()).resolve("libraries");
         if (!wanted.isEmpty() && Files.isDirectory(libsDir)) {
             try (DirectoryStream<Path> libs = Files.newDirectoryStream(libsDir, Files::isDirectory)) {
                 for (Path lib : libs) {
@@ -63,12 +68,7 @@ public final class Libraries {
     private static boolean providesAny(List<Path> jars, Set<String> packages) {
         for (Path jar : jars) {
             try (JarFile jf = new JarFile(jar.toFile())) {
-                boolean found = jf.stream()
-                        .map(ZipEntry::getName)
-                        .filter(n -> n.endsWith(".class") && n.lastIndexOf('/') > 0)
-                        .map(n -> n.substring(0, n.lastIndexOf('/')).replace('/', '.'))
-                        .anyMatch(packages::contains);
-                if (found) return true;
+                if (packagesIn(jf).anyMatch(packages::contains)) return true;
             } catch (IOException ignored) {
                 // unreadable jar, skip
             }
@@ -76,14 +76,23 @@ public final class Libraries {
         return false;
     }
 
+    private static Stream<String> packagesIn(JarFile jar) {
+        return jar.stream()
+                .map(ZipEntry::getName)
+                .filter(name -> name.endsWith(".class") && name.lastIndexOf('/') > 0)
+                .map(name -> name.substring(0, name.lastIndexOf('/')).replace('/', '.'));
+    }
+
     private static List<Path> jarsIn(Path dir) throws IOException {
         if (!Files.isDirectory(dir)) return List.of();
         try (Stream<Path> s = Files.list(dir)) {
-            return s.filter(p -> {
-                String n = p.getFileName().toString().toLowerCase();
-                return n.endsWith(".jar") || n.endsWith(".zip");
-            }).sorted().toList();
+            return s.filter(Libraries::isArchive).sorted().toList();
         }
+    }
+
+    private static boolean isArchive(Path p) {
+        String n = p.getFileName().toString().toLowerCase();
+        return n.endsWith(".jar") || n.endsWith(".zip");
     }
 
     static Path sketchbook() {
@@ -96,7 +105,8 @@ public final class Libraries {
                 List<String> prefs = Files.readAllLines(Path.of(appData, "Processing", "preferences.txt"));
                 for (String key : List.of("sketchbook.path.four=", "sketchbook.path=")) {
                     for (String line : prefs) {
-                        if (line.startsWith(key)) return Path.of(line.substring(key.length()).trim());
+                        if (line.startsWith(key))
+                            return Path.of(line.substring(key.length()).trim());
                     }
                 }
             } catch (IOException ignored) {

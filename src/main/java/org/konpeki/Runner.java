@@ -1,14 +1,9 @@
 package org.konpeki;
 
-import processing.core.PApplet;
-
-import javax.tools.JavaCompiler;
-import javax.tools.ToolProvider;
 import java.io.File;
 import java.io.IOException;
 import java.net.URL;
 import java.net.URLClassLoader;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -22,11 +17,15 @@ import java.util.HexFormat;
 import java.util.List;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+import javax.tools.JavaCompiler;
+import javax.tools.ToolProvider;
+import processing.core.PApplet;
 
 public class Runner {
     private static final Path CACHE_ROOT = Path.of(
             System.getenv().getOrDefault("LOCALAPPDATA", System.getProperty("java.io.tmpdir")),
-            "ProcessingCLI", "cache");
+            "ProcessingCLI",
+            "cache");
     private static final Duration MAX_AGE = Duration.ofDays(30);
 
     public static Path cacheDir(Path sketchDir) throws Exception {
@@ -35,7 +34,8 @@ public class Runner {
     }
 
     public static String stamp(String sketchName, String source, List<Path> libs) throws Exception {
-        StringBuilder sb = new StringBuilder(sketchName).append('\n').append(toolStamp()).append('\n');
+        StringBuilder sb =
+                new StringBuilder(sketchName).append('\n').append(toolStamp()).append('\n');
         for (Path jar : libs) {
             sb.append(jar).append('@').append(Files.getLastModifiedTime(jar)).append('\n');
         }
@@ -50,7 +50,8 @@ public class Runner {
         }
     }
 
-    public static void compile(String className, String javaSource, Path classesDir, String stamp, List<Path> libs) throws Exception {
+    public static void compile(String className, String javaSource, Path classesDir, String stamp, List<Path> libs)
+            throws Exception {
         deleteRecursively(classesDir);
         Files.createDirectories(classesDir);
         Path file = classesDir.resolve(className + ".java");
@@ -58,7 +59,7 @@ public class Runner {
 
         JavaCompiler compiler = ToolProvider.getSystemJavaCompiler();
         if (compiler == null) {
-            throw new IllegalStateException("No Java compiler available: run this with a JDK, not a JRE");
+            throw new IllegalStateException("No Java compiler available");
         }
 
         String classpath = Stream.concat(
@@ -66,9 +67,14 @@ public class Runner {
                         libs.stream().map(Path::toString))
                 .collect(Collectors.joining(File.pathSeparator));
 
-        int result = compiler.run(null, null, null,
-                "-cp", classpath,
-                "-d", classesDir.toString(),
+        int result = compiler.run(
+                null,
+                null,
+                null,
+                "-cp",
+                classpath,
+                "-d",
+                classesDir.toString(),
                 "-proc:none",
                 "-implicit:none",
                 "-nowarn",
@@ -79,7 +85,14 @@ public class Runner {
         Files.writeString(classesDir.resolve(".ok"), stamp);
     }
 
-    public static void launch(String className, Path classesDir, Path sketchDir, List<Path> libs) throws Exception {
+    public static void launch(
+            String className,
+            Path classesDir,
+            Path sketchDir,
+            List<Path> libs,
+            boolean present,
+            List<String> sketchArgs)
+            throws Exception {
         Files.setLastModifiedTime(classesDir.resolve(".ok"), FileTime.from(Instant.now()));
 
         List<URL> urls = new ArrayList<>();
@@ -88,14 +101,18 @@ public class Runner {
         URLClassLoader loader = new URLClassLoader(urls.toArray(URL[]::new), Runner.class.getClassLoader());
         Thread.currentThread().setContextClassLoader(loader);
 
-        PApplet sketch = (PApplet) loader.loadClass(className).getDeclaredConstructor().newInstance();
-        if (Bench.ENABLED) {
+        PApplet sketch =
+                (PApplet) loader.loadClass(className).getDeclaredConstructor().newInstance();
+        if (Bench.enabled()) {
             sketch.registerMethod("post", new Bench.FirstFrame());
         }
-        PApplet.runSketch(new String[]{
-                "--sketch-path=" + sketchDir.toAbsolutePath(),
-                className
-        }, sketch);
+
+        List<String> args = new ArrayList<>();
+        args.add("--sketch-path=" + sketchDir.toAbsolutePath());
+        if (present) args.add("--present");
+        args.add(className);
+        args.addAll(sketchArgs);
+        PApplet.runSketch(args.toArray(String[]::new), sketch);
     }
 
     public static void cleanUpInBackground() {
@@ -104,7 +121,8 @@ public class Runner {
                 Files.createDirectories(CACHE_ROOT);
                 Path marker = CACHE_ROOT.resolve(".last-clean");
                 Instant now = Instant.now();
-                if (Files.exists(marker) && Files.getLastModifiedTime(marker).toInstant().isAfter(now.minus(Duration.ofDays(1)))) {
+                if (Files.exists(marker)
+                        && Files.getLastModifiedTime(marker).toInstant().isAfter(now.minus(Duration.ofDays(1)))) {
                     return;
                 }
                 Files.writeString(marker, "");
@@ -127,7 +145,11 @@ public class Runner {
 
     private static String toolStamp() {
         try {
-            Path self = Path.of(Runner.class.getProtectionDomain().getCodeSource().getLocation().toURI());
+            Path self = Path.of(Runner.class
+                    .getProtectionDomain()
+                    .getCodeSource()
+                    .getLocation()
+                    .toURI());
             return Runtime.version() + "|" + Files.getLastModifiedTime(self);
         } catch (Exception e) {
             return Runtime.version().toString();
@@ -143,7 +165,10 @@ public class Runner {
         if (!Files.exists(p)) return;
         try (Stream<Path> walk = Files.walk(p)) {
             walk.sorted(Comparator.reverseOrder()).forEach(f -> {
-                try { Files.delete(f); } catch (IOException ignored) { }
+                try {
+                    Files.delete(f);
+                } catch (IOException ignored) {
+                }
             });
         }
     }
