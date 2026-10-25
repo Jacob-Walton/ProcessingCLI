@@ -118,7 +118,7 @@ tasks.register("packageApp") {
         }
         val allModules = listing.toString().lines()
             .map { it.substringBefore('@').trim() }
-            .filter { it.isNotEmpty() && !it.startsWith("jdk.incubator") }
+            .filter { it.isNotEmpty() && !it.startsWith("jdk.incubator") && it != "jdk.jlink" && it != "jdk.jpackage" }
             .joinToString(",")
 
         exec.exec {

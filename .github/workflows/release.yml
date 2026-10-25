@@ -1,6 +1,8 @@
 name: Release
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
 
 jobs:
@@ -23,7 +25,7 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
 
-      - run: bash ./gradlew releaseZip
+      - run: ./gradlew releaseZip
 
       - name: Collect zip
         run: |
