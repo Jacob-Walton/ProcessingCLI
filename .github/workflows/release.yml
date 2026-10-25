@@ -1,0 +1,38 @@
+name: Release
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - run: bash ./gradlew releaseZip
+
+      - name: Collect zip
+        run: |
+          mkdir dist
+          # Windows builds outside the project, see buildDirectory in build.gradle.kts
+          if [ -n "$LOCALAPPDATA" ]; then dir="$LOCALAPPDATA/ProcessingCLI-build"; else dir=build; fi
+          cp "$dir"/distributions/ProcessingCLI-*.zip "$dir"/distributions/ProcessingCLI-*.zip.sha256 dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ProcessingCLI-${{ runner.os }}
+          path: dist/

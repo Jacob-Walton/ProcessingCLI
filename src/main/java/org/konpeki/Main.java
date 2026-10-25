@@ -1,6 +1,8 @@
 package org.konpeki;
 
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.FileTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.Callable;
@@ -47,6 +49,8 @@ public class Main implements Callable<Integer> {
     private boolean launched;
 
     static void main(String[] args) {
+        restoreJarTime();
+
         // Warm up AWT + Processing
         Thread.ofPlatform().daemon().start(() -> {
             try {
@@ -62,6 +66,23 @@ public class Main implements Callable<Integer> {
         // On a successful launch, leave the JVM running for the sketch window
         if (code != 0 || !app.launched) {
             System.exit(code);
+        }
+    }
+
+    // Unzipping changes the jar's mtime, which stops the AOT cache loading. Put it back for next launch.
+    private static void restoreJarTime() {
+        Long time = Long.getLong("processingcli.jarTime");
+        if (time == null) return;
+        try {
+            Path jar = Path.of(Main.class
+                    .getProtectionDomain()
+                    .getCodeSource()
+                    .getLocation()
+                    .toURI());
+            if (Files.getLastModifiedTime(jar).toMillis() != time) {
+                Files.setLastModifiedTime(jar, FileTime.fromMillis(time));
+            }
+        } catch (Exception ignored) {
         }
     }
 

@@ -1,6 +1,7 @@
 import org.apache.tools.ant.types.resources.Archives
 import java.lang.module.ModuleFinder
 import java.io.ByteArrayOutputStream
+import java.security.MessageDigest
 
 plugins {
     id("java")
@@ -18,6 +19,10 @@ spotless {
 group = "org.konpeki"
 version = "1.0-SNAPSHOT"
 val processingVersion = "4.5.7"
+val isMac = System.getProperty("os.name").startsWith("Mac")
+val platform = (if (isMac) "macos" else "windows") + "-" + (if (System.getProperty("os.arch") == "aarch64") "arm64" else "x64")
+
+System.getenv("LOCALAPPDATA")?.let { layout.buildDirectory = file("$it/ProcessingCLI-build") }
 
 java {
     toolchain {
@@ -93,7 +98,9 @@ tasks.register("packageApp") {
     val jdk = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(25) }
         .get().metadata.installationPath.asFile.absolutePath
     val fileOps = fs
+    val jarTime = 946684800000L // 2000-01-01T00:00:00Z
     val exec = execOps
+    val mac = isMac
 
     inputs.file(jar)
     inputs.dir(trainingSketch)
@@ -115,7 +122,7 @@ tasks.register("packageApp") {
             .joinToString(",")
 
         exec.exec {
-            commandLine(
+            commandLine(listOfNotNull(
                 "$jdk/bin/jpackage",
                 "--type", "app-image",
                 "--name", "ProcessingCLI",
@@ -124,16 +131,19 @@ tasks.register("packageApp") {
                 "--main-class", "org.konpeki.Main",
                 "--add-modules", allModules,
                 "--jlink-options", "--strip-debug --no-man-pages --no-header-files --generate-cds-archive",
-                "--java-options", "-XX:AOTCache=\$APPDIR/processingcli.aot -Xlog:all=error",
-                "--win-console",
+                "--java-options", "-XX:AOTCache=\$APPDIR/processingcli.aot -Xlog:all=error -Xlog:aot=off -Dprocessingcli.jarTime=$jarTime",
+                if (mac) null else "--win-console",
                 "--dest", out.absolutePath
-            )
+            ))
         }
 
-        val appDir = File(out, "ProcessingCLI/app")
+        val appDir = File(out, if (mac) "ProcessingCLI.app/Contents/app" else "ProcessingCLI/app")
+        val java = File(out, if (mac) "ProcessingCLI.app/Contents/runtime/Contents/Home/bin/java" else "ProcessingCLI/runtime/bin/java.exe")
+        // The AOT cache checks the jar's mtime, and archives don't keep it exactly, so pin it (Main restores it)
+        File(appDir, jar.name).setLastModified(jarTime)
         exec.exec {
             commandLine(
-                File(out, "ProcessingCLI/runtime/bin/java.exe").absolutePath,
+                java.absolutePath,
                 "-XX:AOTCacheOutput=" + File(appDir, "processingcli.aot").absolutePath,
                 "-Xlog:all=error",
                 "-cp", File(appDir, jar.name).absolutePath,
@@ -147,6 +157,32 @@ tasks.register("packageApp") {
     }
 }
 
+tasks.register("singleExe") {
+    group = "distribution"
+    description = "Packs the app-image into one self-extracting exe (needs warp-packer on PATH)."
+    dependsOn("packageApp")
+    val input = layout.buildDirectory.dir("app/ProcessingCLI").get().asFile
+    val output = layout.buildDirectory.file("distributions/ProcessingCLI.exe").get().asFile
+    val exec = execOps
+
+    inputs.dir(input)
+    outputs.file(output)
+
+    doLast {
+        output.parentFile.mkdirs()
+        exec.exec {
+            commandLine(
+                "warp-packer",
+                "--arch", "windows-x64",
+                "--input_dir", input.absolutePath,
+                "--exec", "ProcessingCLI.exe",
+                "--output", output.absolutePath
+            )
+        }
+        println("Built ${output.absolutePath}")
+    }
+}
+
 tasks.register<Zip>("releaseZip") {
     group = "distribution"
     description = "Zips the standalone app for sharing."
@@ -154,8 +190,16 @@ tasks.register<Zip>("releaseZip") {
 
     from(layout.buildDirectory.dir("app"))
     archiveBaseName = "ProcessingCLI"
-    archiveVersion = project.version.toString()
-    archiveClassifier = "windows-x64"
+    archiveVersion = ""
+    archiveClassifier = platform
     destinationDirectory = layout.buildDirectory.dir("distributions")
     isZip64 = true
+    doLast {
+        val zip = archiveFile.get().asFile
+        val sha = MessageDigest.getInstance("SHA-256").digest(zip.readBytes())
+            .joinToString("") { "%02x".format(it) }
+        File("${zip.path}.sha256").writeText("$sha  ${zip.name}\n")
+        println("Built ${zip.absolutePath}")
+        println("Built ${zip.absolutePath}.sha256")
+    }
 }
