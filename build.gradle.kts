@@ -194,6 +194,8 @@ tasks.register<Zip>("releaseZip") {
     archiveClassifier = platform
     destinationDirectory = layout.buildDirectory.dir("distributions")
     isZip64 = true
+    // Gradle 9 writes every file as 644 by default, which drops the macOS launcher's exec bit
+    useFileSystemPermissions()
     doLast {
         val zip = archiveFile.get().asFile
         val sha = MessageDigest.getInstance("SHA-256").digest(zip.readBytes())
