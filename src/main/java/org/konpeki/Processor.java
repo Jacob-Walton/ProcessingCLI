@@ -58,7 +58,8 @@ public class Processor {
 
     public String process(String source) throws Exception {
         StringWriter out = new StringWriter();
-        PdePreprocessor.builderFor(sketchName()).build().write(out, source);
+        // Otherwise it reads editor.tabs.size from Processing's preferences.txt, which may not exist
+        PdePreprocessor.builderFor(sketchName()).setTabSize(2).build().write(out, source);
         return out.toString();
     }
 
