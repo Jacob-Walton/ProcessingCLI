@@ -20,8 +20,16 @@ group = "org.konpeki"
 // Release builds pass -PcliVersion from the git tag
 version = (findProperty("cliVersion") as String?) ?: "1.0.0"
 val processingVersion = "4.5.7"
-val isMac = System.getProperty("os.name").startsWith("Mac")
-val platform = (if (isMac) "macos" else "windows") + "-" + (if (System.getProperty("os.arch") == "aarch64") "arm64" else "x64")
+val os = System.getProperty("os.name").let {
+    when {
+        it.startsWith("Mac") -> "macos"
+        it.startsWith("Windows") -> "windows"
+        else -> "linux"
+    }
+}
+val arm = System.getProperty("os.arch") == "aarch64"
+// Matches Node's process.platform/process.arch naming used by the VS Code extension
+val platform = "$os-" + (if (arm) "arm64" else "x64")
 
 System.getenv("LOCALAPPDATA")?.let { layout.buildDirectory = file("$it/ProcessingCLI-build") }
 
@@ -102,7 +110,12 @@ tasks.register("packageApp") {
     val fileOps = fs
     val jarTime = 946684800000L // 2000-01-01T00:00:00Z
     val exec = execOps
-    val mac = isMac
+    val target = os
+    val nativesDir = when (os) {
+        "macos" -> "macosx-universal"
+        "linux" -> if (arm) "linux-aarch64" else "linux-amd64"
+        else -> "windows-amd64"
+    }
     val zips = archives
     val appVersion = version.toString()
     // Skip probing OpenGL ES (only used on ARM Linux) and load JOGL's natives without unpacking them each launch
@@ -141,13 +154,17 @@ tasks.register("packageApp") {
                 "--add-modules", allModules,
                 "--jlink-options", "--strip-debug --no-man-pages --no-header-files --generate-cds-archive",
                 "--java-options", "-XX:AOTCache=\$APPDIR/processingcli.aot -Xlog:all=error -Xlog:aot=off --enable-native-access=ALL-UNNAMED $jogl -Djava.library.path=\$APPDIR/natives -Dprocessingcli.jarTime=$jarTime -Dprocessingcli.build=$buildId",
-                if (mac) null else "--win-console",
+                if (target == "windows") "--win-console" else null,
                 "--dest", out.absolutePath
             ))
         }
 
-        val appDir = File(out, if (mac) "ProcessingCLI.app/Contents/app" else "ProcessingCLI/app")
-        val java = File(out, if (mac) "ProcessingCLI.app/Contents/runtime/Contents/Home/bin/java" else "ProcessingCLI/runtime/bin/java.exe")
+        // Where jpackage will put the app
+        val (appDir, java) = when (target) {
+            "macos" -> File(out, "ProcessingCLI.app/Contents/app") to File(out, "ProcessingCLI.app/Contents/runtime/Contents/Home/bin/java")
+            "linux" -> File(out, "ProcessingCLI/lib/app") to File(out, "ProcessingCLI/lib/runtime/bin/java")
+            else -> File(out, "ProcessingCLI/app") to File(out, "ProcessingCLI/runtime/bin/java.exe")
+        }
         // Fixed mtime so the AOT cache survives unzipping (restored in Main)
         File(appDir, jar.name).setLastModified(jarTime)
         // jpackage copies everything in build/libs, including jars from older builds
@@ -155,7 +172,7 @@ tasks.register("packageApp") {
 
         val natives = File(appDir, "natives")
         fileOps.copy {
-            from(zips.zipTree(jar)) { include("natives/${if (mac) "macosx-universal" else "windows-amd64"}/*") }
+            from(zips.zipTree(jar)) { include("natives/$nativesDir/*") }
             eachFile { path = name }
             includeEmptyDirs = false
             into(natives)
@@ -205,9 +222,19 @@ tasks.register("singleExe") {
     }
 }
 
-tasks.register<Zip>("releaseZip") {
+// Linux gets a .tar.gz, unzip isn't always installed there
+val release = if (os == "linux") {
+    tasks.register<Tar>("release") {
+        compression = Compression.GZIP
+        archiveExtension = "tar.gz"
+    }
+} else {
+    tasks.register<Zip>("release") { isZip64 = true }
+}
+
+release.configure {
     group = "distribution"
-    description = "Zips the standalone app for sharing."
+    description = "Archives the standalone app for the CDN."
     dependsOn("packageApp")
 
     from(layout.buildDirectory.dir("app"))
@@ -215,15 +242,14 @@ tasks.register<Zip>("releaseZip") {
     archiveVersion = ""
     archiveClassifier = platform
     destinationDirectory = layout.buildDirectory.dir("distributions")
-    isZip64 = true
-    // Keep exec bits for the macOS launcher
+    // Keep exec bits for the macOS and Linux launchers
     useFileSystemPermissions()
     doLast {
-        val zip = archiveFile.get().asFile
-        val sha = MessageDigest.getInstance("SHA-256").digest(zip.readBytes())
+        val archive = archiveFile.get().asFile
+        val sha = MessageDigest.getInstance("SHA-256").digest(archive.readBytes())
             .joinToString("") { "%02x".format(it) }
-        File("${zip.path}.sha256").writeText("$sha  ${zip.name}\n")
-        println("Built ${zip.absolutePath}")
-        println("Built ${zip.absolutePath}.sha256")
+        File("${archive.path}.sha256").writeText("$sha  ${archive.name}\n")
+        println("Built ${archive.absolutePath}")
+        println("Built ${archive.absolutePath}.sha256")
     }
 }

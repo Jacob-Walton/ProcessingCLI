@@ -11,7 +11,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest]
+        os: [windows-latest, macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -27,16 +27,18 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
 
       # Tags like v1.2.3 build version 1.2.3
+      # AOT training opens a sketch window, Linux runners have no display without xvfb
       - run: |
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then version="-PcliVersion=${GITHUB_REF_NAME#v}"; fi
-          ./gradlew releaseZip $version
+          if [ "$RUNNER_OS" = Linux ]; then display="xvfb-run -a"; fi
+          $display ./gradlew release $version
 
-      - name: Collect zip
+      - name: Collect archive
         run: |
           mkdir dist
           # Windows builds into LOCALAPPDATA
           if [ -n "$LOCALAPPDATA" ]; then dir="$LOCALAPPDATA/ProcessingCLI-build"; else dir=build; fi
-          cp "$dir"/distributions/ProcessingCLI-*.zip "$dir"/distributions/ProcessingCLI-*.zip.sha256 dist/
+          cp "$dir"/distributions/ProcessingCLI-* dist/
 
       - uses: actions/upload-artifact@v4
         with:
@@ -72,8 +74,12 @@ jobs:
       - name: Update latest.json
         run: |
           version="${GITHUB_REF_NAME#v}"
-          entry() { echo "\"$1\": {\"url\": \"$version/ProcessingCLI-$1.zip\", \"sha256\": \"$(cut -d' ' -f1 "dist/ProcessingCLI-$1.zip.sha256")\"}"; }
-          echo "{\"version\": \"$version\", \"files\": {$(entry windows-x64), $(entry macos-arm64)}}" > latest.json
+          # .zip or .tar.gz depending on the platform
+          entry() {
+            file=$(cd dist && ls "ProcessingCLI-$1".* | grep -v '\.sha256$')
+            echo "\"$1\": {\"url\": \"$version/$file\", \"sha256\": \"$(cut -d' ' -f1 "dist/$file.sha256")\"}"
+          }
+          echo "{\"version\": \"$version\", \"files\": {$(entry windows-x64), $(entry macos-arm64), $(entry linux-x64)}}" > latest.json
           cat latest.json
           aws s3 cp latest.json "$BUCKET/latest.json" --endpoint-url "$R2" \
             --cache-control "no-cache" --content-type application/json
