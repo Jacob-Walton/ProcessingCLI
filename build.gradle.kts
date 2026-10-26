@@ -57,6 +57,8 @@ dependencies {
     implementation(files("libs/processing-utils-4.5.7.jar"))
     implementation("info.picocli:picocli:4.7.7")
     implementation("org.eclipse.lsp4j:org.eclipse.lsp4j:0.23.1")
+    compileOnly("org.jogamp.jogl:jogl-all:2.6.0")
+    compileOnly("org.jogamp.gluegen:gluegen-rt:2.6.0")
 }
 
 application {
@@ -193,32 +195,6 @@ tasks.register("packageApp") {
             environment("PCLI_BENCH", "1")
             environment("LOCALAPPDATA", trainingCache.absolutePath)
         }
-    }
-}
-
-tasks.register("singleExe") {
-    group = "distribution"
-    description = "Packs the app-image into one self-extracting exe (needs warp-packer on PATH)."
-    dependsOn("packageApp")
-    val input = layout.buildDirectory.dir("app/ProcessingCLI").get().asFile
-    val output = layout.buildDirectory.file("distributions/ProcessingCLI.exe").get().asFile
-    val exec = execOps
-
-    inputs.dir(input)
-    outputs.file(output)
-
-    doLast {
-        output.parentFile.mkdirs()
-        exec.exec {
-            commandLine(
-                "warp-packer",
-                "--arch", "windows-x64",
-                "--input_dir", input.absolutePath,
-                "--exec", "ProcessingCLI.exe",
-                "--output", output.absolutePath
-            )
-        }
-        println("Built ${output.absolutePath}")
     }
 }
 

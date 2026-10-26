@@ -12,6 +12,27 @@ public class PreviewSurface extends PSurfaceNone {
         super(graphics);
     }
 
+    // PSurfaceNone's animation loop, but timed to the preview's display refresh instead of sleeping
+    @Override
+    public Thread createThread() {
+        return new Thread(
+                () -> {
+                    Pacer pacer = new Pacer();
+                    sketch.start();
+                    try {
+                        while (Thread.currentThread() == thread && !sketch.finished) {
+                            checkPause();
+                            pacer.await(frameRatePeriod);
+                            sketch.handleDraw();
+                        }
+                    } catch (InterruptedException ignored) {
+                    }
+                    sketch.dispose();
+                    if (sketch.exitCalled()) sketch.exitActual();
+                },
+                "Animation Thread");
+    }
+
     // PSurfaceNone skips this when the size hasn't changed, leaving pixelWidth and pixelHeight at 0
     @Override
     public void setSize(int width, int height) {

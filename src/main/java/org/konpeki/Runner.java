@@ -55,7 +55,8 @@ public class Runner {
         }
     }
 
-    public static void compile(String className, String javaSource, Path classesDir, String stamp, List<Path> libs)
+    public static void compile(
+            String className, String javaSource, List<Path> javaTabs, Path classesDir, String stamp, List<Path> libs)
             throws Exception {
         deleteRecursively(classesDir);
         Files.createDirectories(classesDir);
@@ -76,7 +77,9 @@ public class Runner {
 
         List<String> options =
                 List.of("-cp", classpath, "-d", classesDir.toString(), "-proc:none", "-implicit:none", "-nowarn");
-        boolean compiled = compiler.getTask(null, files, null, options, null, files.getJavaFileObjects(file))
+        List<Path> sources = Stream.concat(Stream.of(file), javaTabs.stream()).toList();
+        boolean compiled = compiler.getTask(
+                        null, files, null, options, null, files.getJavaFileObjectsFromPaths(sources))
                 .call();
         if (!compiled) {
             throw new IllegalStateException("Sketch failed to compile (see errors above)");

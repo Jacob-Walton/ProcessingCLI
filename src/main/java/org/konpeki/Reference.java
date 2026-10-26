@@ -28,24 +28,30 @@ final class Reference {
     private static Map<String, Entry> entries;
 
     static String hover(Element element, String className) {
-        StringBuilder text = new StringBuilder("```java\n")
-                .append(signature(element, className))
-                .append("\n```");
+        String docs = docs(element);
+        return "```java\n" + signature(element, className) + "\n```" + (docs == null ? "" : "\n\n" + docs);
+    }
+
+    static String docs(Element element) {
         String key = key(element);
         Entry entry = key == null ? null : entries().get(key);
-        if (entry != null) {
-            text.append("\n\n").append(entry.description());
-            if (!entry.parameters().isEmpty()) {
-                text.append("\n");
-                for (Parameter p : entry.parameters()) {
-                    text.append("\n- `").append(p.name()).append("`: ").append(p.description());
-                }
+        if (entry == null) return null;
+        StringBuilder text = new StringBuilder(entry.description());
+        if (!entry.parameters().isEmpty()) {
+            text.append("\n");
+            for (Parameter p : entry.parameters()) {
+                text.append("\n- `").append(p.name()).append("`: ").append(p.description());
             }
-            text.append("\n\n[Reference](https://processing.org/reference/")
-                    .append(key)
-                    .append(".html)");
         }
-        return text.toString();
+        return text.append("\n\n[Reference](https://processing.org/reference/")
+                .append(key)
+                .append(".html)")
+                .toString();
+    }
+
+    static boolean documented(Element element) {
+        String key = key(element);
+        return key != null && entries().containsKey(key);
     }
 
     // File names in the reference: ellipse_, mouseX, PVector, PVector_add_
@@ -79,7 +85,7 @@ final class Reference {
                 && parent.getQualifiedName().contentEquals("processing.core.PApplet");
     }
 
-    private static String signature(Element element, String className) {
+    static String signature(Element element, String className) {
         String name = element.getSimpleName().toString();
         String text =
                 switch (element) {

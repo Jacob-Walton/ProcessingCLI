@@ -150,15 +150,18 @@ public class Main implements Callable<Integer> {
             Processor processor = new Processor(sketch);
             String name = processor.sketchName();
             String source = processor.source();
-            warmUpOpenGL(source);
+            List<Path> javaTabs = Processor.javaTabs(sketch);
+            StringBuilder everything = new StringBuilder(source);
+            for (Path tab : javaTabs) everything.append(Files.readString(tab)).append('\n');
+            warmUpOpenGL(everything.toString());
 
-            List<Path> libs = Libraries.forSketch(sketch, source, sketchbook);
+            List<Path> libs = Libraries.forSketch(sketch, everything.toString(), sketchbook);
             Path classes = Runner.cacheDir(sketch);
-            String stamp = Runner.stamp(name, source, libs);
+            String stamp = Runner.stamp(name, everything.toString(), libs);
             if (noCache || !Runner.isCompiled(classes, stamp)) {
                 String code = processor.process(source);
                 Bench.mark("processed");
-                Runner.compile(name, Preview.hideable(code), classes, stamp, libs);
+                Runner.compile(name, Preview.hideable(code), javaTabs, classes, stamp, libs);
                 Bench.mark("compiled");
             } else {
                 Bench.mark("cache-hit");

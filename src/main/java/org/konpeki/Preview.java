@@ -20,11 +20,11 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BooleanSupplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import processing.core.PApplet;
+import processing.core.PGraphics;
 import processing.core.PSurface;
 import processing.event.KeyEvent;
 import processing.event.MouseEvent;
@@ -96,10 +96,9 @@ public class Preview {
         int end = code.lastIndexOf('}');
         return code.substring(0, end)
                 + "  @Override protected processing.core.PSurface initSurface() {"
-                + " if (!org.konpeki.Preview.headless(this)) return super.initSurface();"
+                + " if (!org.konpeki.Preview.active()) return super.initSurface();"
                 + " g = createPrimaryGraphics();"
-                + " surface = new org.konpeki.PreviewSurface(g);"
-                + " surface.initOffscreen(this);"
+                + " surface = org.konpeki.Preview.surface(this, g);"
                 + " return surface; }\n"
                 + "  @Override protected void showSurface() {"
                 + " if (org.konpeki.Preview.shouldShow(this)) super.showSurface(); }\n"
@@ -108,18 +107,28 @@ public class Preview {
                 + code.substring(end);
     }
 
-    // OpenGL still needs its window for a GL context
-    public static boolean headless(PApplet sketch) {
-        return Boolean.getBoolean("processingcli.preview")
-                && !sketch.sketchRenderer().startsWith("processing.opengl");
+    public static boolean active() {
+        return Boolean.getBoolean("processingcli.preview");
     }
 
+    // Java2D draws into its own image with no window. OpenGL needs a window for its context, kept off screen
+    // (JOGL's truly off-screen window takes over a second to create, too slow for reloads)
+    public static PSurface surface(PApplet sketch, PGraphics graphics) {
+        if (graphics.isGL()) {
+            PSurface surface = new PreviewSurfaceJOGL(graphics);
+            surface.initFrame(sketch);
+            return surface;
+        }
+        PSurface surface = new PreviewSurface(graphics);
+        surface.initOffscreen(sketch);
+        return surface;
+    }
+
+    // OpenGL only draws while its window is visible, so show it off screen
     public static boolean shouldShow(PApplet sketch) {
-        if (!Boolean.getBoolean("processingcli.preview")) return true;
         PSurface surface = sketch.getSurface();
         if (surface instanceof PreviewSurface) return false;
-        // OpenGL only draws while the window is visible, so show it off screen
-        surface.setLocation(-30000, -30000);
+        if (surface instanceof PreviewSurfaceJOGL) surface.setLocation(-30000, -30000);
         return true;
     }
 
@@ -159,11 +168,12 @@ public class Preview {
     /** Sends each finished frame of one sketch, registered as its "post" method. */
     public static final class Frames {
         private final PApplet owner;
-        // Drop frames while the last one is still sending, so the sketch doesn't wait on the preview
-        private final AtomicBoolean sending = new AtomicBoolean();
         private final ExecutorService sender =
                 Executors.newSingleThreadExecutor(Thread.ofPlatform().daemon().factory());
-        private ByteBuffer frame;
+        // Two buffers: while one frame sends, the next waits in the other instead of being dropped.
+        // A newer frame replaces a waiting one, so the preview never falls behind
+        private final ByteBuffer[] buffers = new ByteBuffer[2];
+        private ByteBuffer sending, waiting;
         private boolean announced;
 
         Frames(PApplet owner) {
@@ -172,19 +182,22 @@ public class Preview {
 
         public void post() {
             SocketChannel channel = session.client;
-            if (owner != session.sketch || channel == null || !sending.compareAndSet(false, true)) return;
+            if (owner != session.sketch || channel == null) return;
             int pw = owner.pixelWidth, ph = owner.pixelHeight;
             int[] pixels = pixels();
-            if (pixels == null || pixels.length < pw * ph) {
-                sending.set(false);
-                return;
-            }
+            if (pixels == null || pixels.length < pw * ph) return;
 
+            int slot;
+            synchronized (this) {
+                slot = buffers[0] != null && buffers[0] == sending ? 1 : 0;
+                if (waiting == buffers[slot]) waiting = null;
+            }
             // Binary WebSocket message: pixelWidth, pixelHeight, width, height, then ARGB ints (BGRA bytes)
             int payload = 16 + pw * ph * 4;
-            if (frame == null || frame.capacity() < 10 + payload) {
-                frame = ByteBuffer.allocateDirect(10 + payload);
+            if (buffers[slot] == null || buffers[slot].capacity() < 10 + payload) {
+                buffers[slot] = ByteBuffer.allocateDirect(10 + payload);
             }
+            ByteBuffer frame = buffers[slot];
             frame.clear();
             frame.order(ByteOrder.BIG_ENDIAN).put((byte) 0x82).put((byte) 127).putLong(payload);
             frame.order(ByteOrder.LITTLE_ENDIAN)
@@ -197,16 +210,39 @@ public class Preview {
 
             boolean first = !announced;
             announced = true;
-            sender.execute(() -> {
-                try {
-                    if (first) session.status("running");
-                    session.send(channel, frame);
-                } catch (IOException ignored) {
-                    // Preview went away, wait for it to reconnect
-                } finally {
-                    sending.set(false);
+            synchronized (this) {
+                if (sending != null) {
+                    waiting = frame;
+                    return;
                 }
-            });
+                sending = frame;
+            }
+            sender.execute(() -> send(channel, first));
+        }
+
+        // Sends the frame, then any that came in meanwhile
+        private void send(SocketChannel channel, boolean first) {
+            try {
+                if (first) session.status("running");
+                while (true) {
+                    ByteBuffer frame;
+                    synchronized (this) {
+                        frame = sending;
+                    }
+                    session.send(channel, frame);
+                    synchronized (this) {
+                        sending = waiting;
+                        waiting = null;
+                        if (sending == null) return;
+                    }
+                }
+            } catch (IOException e) {
+                // Preview went away, wait for it to reconnect
+                synchronized (this) {
+                    sending = null;
+                    waiting = null;
+                }
+            }
         }
 
         // Java2D draws into a BufferedImage, read it directly instead of copying through loadPixels
@@ -324,6 +360,11 @@ public class Preview {
     }
 
     private void handle(ByteBuffer input) {
+        // The preview drew a frame, see Pacer
+        if (input.get(0) == 'T') {
+            Pacer.tick();
+            return;
+        }
         PApplet target = sketch;
         if (target == null) return;
         long now = System.currentTimeMillis();

@@ -43,6 +43,12 @@ public class Processor {
         }
     }
 
+    static List<Path> javaTabs(Path dir) throws IOException {
+        try (Stream<Path> s = Files.list(dir)) {
+            return s.filter(p -> p.toString().endsWith(".java")).sorted().toList();
+        }
+    }
+
     public String sketchName() {
         return sketchName(dir);
     }
