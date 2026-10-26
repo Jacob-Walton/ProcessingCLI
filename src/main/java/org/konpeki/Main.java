@@ -69,7 +69,7 @@ public class Main implements Callable<Integer> {
         }
     }
 
-    // Unzipping changes the jar's mtime, which stops the AOT cache loading. Put it back for next launch.
+    // AOT cache only loads if the jar mtime matches the build
     private static void restoreJarTime() {
         Long time = Long.getLong("processingcli.jarTime");
         if (time == null) return;

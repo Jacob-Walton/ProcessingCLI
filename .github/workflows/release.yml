@@ -30,7 +30,7 @@ jobs:
       - name: Collect zip
         run: |
           mkdir dist
-          # Windows builds outside the project, see buildDirectory in build.gradle.kts
+          # Windows builds into LOCALAPPDATA
           if [ -n "$LOCALAPPDATA" ]; then dir="$LOCALAPPDATA/ProcessingCLI-build"; else dir=build; fi
           cp "$dir"/distributions/ProcessingCLI-*.zip "$dir"/distributions/ProcessingCLI-*.zip.sha256 dist/
 

@@ -139,12 +139,14 @@ tasks.register("packageApp") {
 
         val appDir = File(out, if (mac) "ProcessingCLI.app/Contents/app" else "ProcessingCLI/app")
         val java = File(out, if (mac) "ProcessingCLI.app/Contents/runtime/Contents/Home/bin/java" else "ProcessingCLI/runtime/bin/java.exe")
-        // The AOT cache checks the jar's mtime, and archives don't keep it exactly, so pin it (Main restores it)
+        // Fixed mtime so the AOT cache survives unzipping (restored in Main)
         File(appDir, jar.name).setLastModified(jarTime)
         exec.exec {
             commandLine(
                 java.absolutePath,
                 "-XX:AOTCacheOutput=" + File(appDir, "processingcli.aot").absolutePath,
+                // Linked classes have no code source, which breaks PApplet.calcSketchPath
+                "-XX:-AOTClassLinking",
                 "-Xlog:all=error",
                 "-cp", File(appDir, jar.name).absolutePath,
                 "org.konpeki.Main",
@@ -194,7 +196,7 @@ tasks.register<Zip>("releaseZip") {
     archiveClassifier = platform
     destinationDirectory = layout.buildDirectory.dir("distributions")
     isZip64 = true
-    // Gradle 9 writes every file as 644 by default, which drops the macOS launcher's exec bit
+    // Keep exec bits for the macOS launcher
     useFileSystemPermissions()
     doLast {
         val zip = archiveFile.get().asFile
