@@ -82,6 +82,10 @@ public class Main implements Callable<Integer> {
         Main app = new Main();
         int code = new CommandLine(app).execute(args);
 
+        // The preview keeps this JVM and reloads the sketch in it on each save
+        if (app.preview != null && code == 0) {
+            Preview.serveReloads(app::runSketch);
+        }
         // On a successful launch, leave the JVM running for the sketch window
         if (code != 0 || !app.launched) {
             System.exit(code);
@@ -126,17 +130,27 @@ public class Main implements Callable<Integer> {
 
         Runner.cleanUpInBackground();
 
-        Processor processor = new Processor(sketch);
-        String name = processor.sketchName();
+        if (emitJava) {
+            Processor processor = new Processor(sketch);
+            System.out.println(processor.process(processor.source()));
+            return 0;
+        }
+        if (preview != null) {
+            // A compile error waits for the next save instead of ending the preview
+            Preview.start(preview);
+            runSketch();
+            return 0;
+        }
+        return runSketch() ? 0 : 1;
+    }
 
+    // Compiles if the sketch changed, then launches it
+    private boolean runSketch() {
         try {
+            Processor processor = new Processor(sketch);
+            String name = processor.sketchName();
             String source = processor.source();
             warmUpOpenGL(source);
-
-            if (emitJava) {
-                System.out.println(processor.process(source));
-                return 0;
-            }
 
             List<Path> libs = Libraries.forSketch(sketch, source, sketchbook);
             Path classes = Runner.cacheDir(sketch);
@@ -150,16 +164,18 @@ public class Main implements Callable<Integer> {
                 Bench.mark("cache-hit");
             }
 
-            Runner.launch(name, classes, sketch, libs, present, sketchArgs, preview);
+            Runner.launch(name, classes, sketch, libs, present, sketchArgs);
             Bench.mark("launched");
             launched = true;
-            return 0;
+            return true;
         } catch (SketchException e) {
             System.err.println("Sketch error: " + e.getMessage());
-            return 1;
         } catch (IllegalStateException e) {
             System.err.println(e.getMessage());
-            return 1;
+        } catch (Exception e) {
+            e.printStackTrace();
         }
+        Preview.failed();
+        return false;
     }
 }

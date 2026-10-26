@@ -6,6 +6,7 @@ import java.io.IOException;
 import java.io.PrintStream;
 import java.net.URL;
 import java.net.URLClassLoader;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -20,6 +21,7 @@ import java.util.List;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import javax.tools.JavaCompiler;
+import javax.tools.StandardJavaFileManager;
 import javax.tools.ToolProvider;
 import processing.core.PApplet;
 
@@ -29,6 +31,7 @@ public class Runner {
             "ProcessingCLI",
             "cache");
     private static final Duration MAX_AGE = Duration.ofDays(30);
+    private static StandardJavaFileManager files;
 
     public static Path cacheDir(Path sketchDir) throws Exception {
         String key = sketchDir.toAbsolutePath().normalize().toString().toLowerCase();
@@ -63,25 +66,19 @@ public class Runner {
         if (compiler == null) {
             throw new IllegalStateException("No Java compiler available");
         }
+        // Reused so the classpath jars are only indexed once per preview session
+        if (files == null) files = compiler.getStandardFileManager(null, null, StandardCharsets.UTF_8);
 
         String classpath = Stream.concat(
                         Stream.of(System.getProperty("java.class.path")),
                         libs.stream().map(Path::toString))
                 .collect(Collectors.joining(File.pathSeparator));
 
-        int result = compiler.run(
-                null,
-                null,
-                null,
-                "-cp",
-                classpath,
-                "-d",
-                classesDir.toString(),
-                "-proc:none",
-                "-implicit:none",
-                "-nowarn",
-                file.toString());
-        if (result != 0) {
+        List<String> options =
+                List.of("-cp", classpath, "-d", classesDir.toString(), "-proc:none", "-implicit:none", "-nowarn");
+        boolean compiled = compiler.getTask(null, files, null, options, null, files.getJavaFileObjects(file))
+                .call();
+        if (!compiled) {
             throw new IllegalStateException("Sketch failed to compile (see errors above)");
         }
         Files.writeString(classesDir.resolve(".ok"), stamp);
@@ -93,8 +90,7 @@ public class Runner {
             Path sketchDir,
             List<Path> libs,
             boolean present,
-            List<String> sketchArgs,
-            String preview)
+            List<String> sketchArgs)
             throws Exception {
         Files.setLastModifiedTime(classesDir.resolve(".ok"), FileTime.from(Instant.now()));
 
@@ -109,9 +105,7 @@ public class Runner {
         if (Bench.enabled()) {
             sketch.registerMethod("post", new Bench.FirstFrame());
         }
-        if (preview != null) {
-            Preview.attach(sketch, preview);
-        }
+        Preview.attach(sketch);
 
         List<String> args = new ArrayList<>();
         args.add("--sketch-path=" + sketchDir.toAbsolutePath());
