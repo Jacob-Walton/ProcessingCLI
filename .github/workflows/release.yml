@@ -3,6 +3,7 @@ name: Release
 on:
   push:
     branches: [main]
+    tags: ['v*']
   workflow_dispatch:
 
 jobs:
@@ -25,7 +26,10 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
 
-      - run: ./gradlew releaseZip
+      # Tags like v1.2.3 build version 1.2.3
+      - run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then version="-PcliVersion=${GITHUB_REF_NAME#v}"; fi
+          ./gradlew releaseZip $version
 
       - name: Collect zip
         run: |
@@ -38,3 +42,38 @@ jobs:
         with:
           name: ProcessingCLI-${{ runner.os }}
           path: dist/
+
+  upload:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      # R2 doesn't support the newer default AWS checksums
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+      R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+      BUCKET: s3://${{ secrets.R2_BUCKET }}/processingcli
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Upload version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          aws s3 cp dist/ "$BUCKET/$version/" --recursive --endpoint-url "$R2" \
+            --cache-control "public, max-age=31536000, immutable"
+
+      # Last, so the manifest never points at files that aren't there yet
+      - name: Update latest.json
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          entry() { echo "\"$1\": {\"url\": \"$version/ProcessingCLI-$1.zip\", \"sha256\": \"$(cut -d' ' -f1 "dist/ProcessingCLI-$1.zip.sha256")\"}"; }
+          echo "{\"version\": \"$version\", \"files\": {$(entry windows-x64), $(entry macos-arm64)}}" > latest.json
+          cat latest.json
+          aws s3 cp latest.json "$BUCKET/latest.json" --endpoint-url "$R2" \
+            --cache-control "no-cache" --content-type application/json

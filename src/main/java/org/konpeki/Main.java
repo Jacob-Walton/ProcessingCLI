@@ -6,6 +6,7 @@ import java.nio.file.attribute.FileTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.Callable;
+import java.util.regex.Pattern;
 import picocli.CommandLine;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
@@ -15,9 +16,17 @@ import processing.utils.SketchException;
 @Command(
         name = "ProcessingCLI",
         mixinStandardHelpOptions = true,
-        version = "ProcessingCLI 1.0",
+        versionProvider = Main.Version.class,
         description = "Preprocesses, compiles, and runs a Processing sketch.")
 public class Main implements Callable<Integer> {
+
+    // jpackage sets this from the build's version
+    static class Version implements CommandLine.IVersionProvider {
+        @Override
+        public String[] getVersion() {
+            return new String[] {"ProcessingCLI " + System.getProperty("jpackage.app-version", "dev")};
+        }
+    }
 
     @Parameters(index = "0", paramLabel = "SKETCH", description = "Sketch folder (must contain <folder name>.pde).")
     Path sketch;
@@ -46,10 +55,20 @@ public class Main implements Callable<Integer> {
     @Option(names = "--bench", description = "Print startup timings and exit after the first frame.")
     boolean bench;
 
+    @Option(names = "--preview", hidden = true, paramLabel = "PORT/TOKEN")
+    String preview;
+
+    private static final Pattern OPENGL = Pattern.compile("\\b(P2D|P3D|OPENGL)\\b");
+
     private boolean launched;
 
-    static void main(String[] args) {
+    static void main(String[] args) throws Exception {
         restoreJarTime();
+
+        if (args.length > 0 && args[0].equals("lsp")) {
+            Lsp.run();
+            return;
+        }
 
         // Warm up AWT + Processing
         Thread.ofPlatform().daemon().start(() -> {
@@ -86,6 +105,20 @@ public class Main implements Callable<Integer> {
         }
     }
 
+    // Probing OpenGL is most of a P2D/P3D launch, so start it while the sketch compiles
+    private static void warmUpOpenGL(String source) {
+        if (System.getProperty("os.name").startsWith("Mac")
+                || !OPENGL.matcher(source).find()) return;
+        Thread.ofPlatform().daemon().start(() -> {
+            try {
+                Class.forName("com.jogamp.opengl.GLProfile")
+                        .getMethod("initSingleton")
+                        .invoke(null);
+            } catch (Throwable ignored) {
+            }
+        });
+    }
+
     @Override
     public Integer call() throws Exception {
         if (bench) Bench.enable();
@@ -98,6 +131,7 @@ public class Main implements Callable<Integer> {
 
         try {
             String source = processor.source();
+            warmUpOpenGL(source);
 
             if (emitJava) {
                 System.out.println(processor.process(source));
@@ -110,13 +144,13 @@ public class Main implements Callable<Integer> {
             if (noCache || !Runner.isCompiled(classes, stamp)) {
                 String code = processor.process(source);
                 Bench.mark("processed");
-                Runner.compile(name, code, classes, stamp, libs);
+                Runner.compile(name, Preview.hideable(code), classes, stamp, libs);
                 Bench.mark("compiled");
             } else {
                 Bench.mark("cache-hit");
             }
 
-            Runner.launch(name, classes, sketch, libs, present, sketchArgs);
+            Runner.launch(name, classes, sketch, libs, present, sketchArgs, preview);
             Bench.mark("launched");
             launched = true;
             return 0;

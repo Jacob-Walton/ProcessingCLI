@@ -28,16 +28,26 @@ public class Processor {
             fail("Expected a sketch file at %s", mainFile);
         }
 
+        this.paths = tabs(dir);
+    }
+
+    // Main tab first, then the rest in name order
+    static List<Path> tabs(Path dir) throws IOException {
+        Path main = dir.resolve(dir.getFileName() + ".pde");
         try (Stream<Path> s = Files.list(dir)) {
-            this.paths = Stream.concat(
-                            Stream.of(mainFile),
-                            s.filter(p -> p.toString().endsWith(".pde") && !p.equals(mainFile))
+            return Stream.concat(
+                            Stream.of(main),
+                            s.filter(p -> p.toString().endsWith(".pde") && !p.equals(main))
                                     .sorted())
                     .toList();
         }
     }
 
     public String sketchName() {
+        return sketchName(dir);
+    }
+
+    static String sketchName(Path dir) {
         String raw = dir.getFileName().toString();
         StringBuilder sb = new StringBuilder();
         raw.codePoints().forEach(cp -> sb.appendCodePoint(Character.isJavaIdentifierPart(cp) ? cp : '_'));

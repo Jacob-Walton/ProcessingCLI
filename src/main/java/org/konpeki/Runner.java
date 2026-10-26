@@ -93,7 +93,8 @@ public class Runner {
             Path sketchDir,
             List<Path> libs,
             boolean present,
-            List<String> sketchArgs)
+            List<String> sketchArgs,
+            String preview)
             throws Exception {
         Files.setLastModifiedTime(classesDir.resolve(".ok"), FileTime.from(Instant.now()));
 
@@ -107,6 +108,9 @@ public class Runner {
                 (PApplet) loader.loadClass(className).getDeclaredConstructor().newInstance();
         if (Bench.enabled()) {
             sketch.registerMethod("post", new Bench.FirstFrame());
+        }
+        if (preview != null) {
+            Preview.attach(sketch, preview);
         }
 
         List<String> args = new ArrayList<>();
@@ -164,6 +168,9 @@ public class Runner {
     }
 
     private static String toolStamp() {
+        // Packaged builds pin the jar mtime for the AOT cache, so use the build id instead
+        String build = System.getProperty("processingcli.build");
+        if (build != null) return Runtime.version() + "|" + build;
         try {
             Path self = Path.of(Runner.class
                     .getProtectionDomain()

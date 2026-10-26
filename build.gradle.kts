@@ -17,7 +17,8 @@ spotless {
 }
 
 group = "org.konpeki"
-version = "1.0-SNAPSHOT"
+// Release builds pass -PcliVersion from the git tag
+version = (findProperty("cliVersion") as String?) ?: "1.0.0"
 val processingVersion = "4.5.7"
 val isMac = System.getProperty("os.name").startsWith("Mac")
 val platform = (if (isMac) "macos" else "windows") + "-" + (if (System.getProperty("os.arch") == "aarch64") "arm64" else "x64")
@@ -47,6 +48,7 @@ dependencies {
     }
     implementation(files("libs/processing-utils-4.5.7.jar"))
     implementation("info.picocli:picocli:4.7.7")
+    implementation("org.eclipse.lsp4j:org.eclipse.lsp4j:0.23.1")
 }
 
 application {
@@ -101,6 +103,10 @@ tasks.register("packageApp") {
     val jarTime = 946684800000L // 2000-01-01T00:00:00Z
     val exec = execOps
     val mac = isMac
+    val zips = archives
+    val appVersion = version.toString()
+    // Skip probing OpenGL ES (only used on ARM Linux) and load JOGL's natives without unpacking them each launch
+    val jogl = "-Djogl.disable.opengles -Djogamp.gluegen.UseTempJarCache=false"
 
     inputs.file(jar)
     inputs.dir(trainingSketch)
@@ -109,6 +115,8 @@ tasks.register("packageApp") {
 
     doLast {
         fileOps.delete { delete(out, trainingCache) }
+        // Invalidates compiled sketch caches from older builds
+        val buildId = System.currentTimeMillis()
 
         // Every module in the toolchain JDK (not Gradle's own JVM)
         val listing = ByteArrayOutputStream()
@@ -126,12 +134,13 @@ tasks.register("packageApp") {
                 "$jdk/bin/jpackage",
                 "--type", "app-image",
                 "--name", "ProcessingCLI",
+                "--app-version", appVersion,
                 "--input", jar.parent,
                 "--main-jar", jar.name,
                 "--main-class", "org.konpeki.Main",
                 "--add-modules", allModules,
                 "--jlink-options", "--strip-debug --no-man-pages --no-header-files --generate-cds-archive",
-                "--java-options", "-XX:AOTCache=\$APPDIR/processingcli.aot -Xlog:all=error -Xlog:aot=off -Dprocessingcli.jarTime=$jarTime",
+                "--java-options", "-XX:AOTCache=\$APPDIR/processingcli.aot -Xlog:all=error -Xlog:aot=off --enable-native-access=ALL-UNNAMED $jogl -Djava.library.path=\$APPDIR/natives -Dprocessingcli.jarTime=$jarTime -Dprocessingcli.build=$buildId",
                 if (mac) null else "--win-console",
                 "--dest", out.absolutePath
             ))
@@ -141,16 +150,29 @@ tasks.register("packageApp") {
         val java = File(out, if (mac) "ProcessingCLI.app/Contents/runtime/Contents/Home/bin/java" else "ProcessingCLI/runtime/bin/java.exe")
         // Fixed mtime so the AOT cache survives unzipping (restored in Main)
         File(appDir, jar.name).setLastModified(jarTime)
+        // jpackage copies everything in build/libs, including jars from older builds
+        appDir.listFiles { f -> f.name.endsWith(".jar") && f.name != jar.name }?.forEach { it.delete() }
+
+        val natives = File(appDir, "natives")
+        fileOps.copy {
+            from(zips.zipTree(jar)) { include("natives/${if (mac) "macosx-universal" else "windows-amd64"}/*") }
+            eachFile { path = name }
+            includeEmptyDirs = false
+            into(natives)
+        }
+
         exec.exec {
-            commandLine(
+            commandLine(listOf(
                 java.absolutePath,
                 "-XX:AOTCacheOutput=" + File(appDir, "processingcli.aot").absolutePath,
                 "-Xlog:all=error",
+                "--enable-native-access=ALL-UNNAMED",
+                "-Djava.library.path=" + natives.absolutePath) + jogl.split(" ") + listOf(
                 "-cp", File(appDir, jar.name).absolutePath,
                 "org.konpeki.Main",
                 "--bench",
                 trainingSketch.absolutePath
-            )
+            ))
             environment("PCLI_BENCH", "1")
             environment("LOCALAPPDATA", trainingCache.absolutePath)
         }

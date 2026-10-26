@@ -1,0 +1,9 @@
+reference.json is generated from the Processing reference by the Processing Foundation,
+https://github.com/processing/processing-website (content/references/translations/en/processing).
+
+The Processing reference is licensed under the Creative Commons
+Attribution-NonCommercial-ShareAlike 4.0 International License (CC BY-NC-SA 4.0),
+https://creativecommons.org/licenses/by-nc-sa/4.0/
+
+reference.json is distributed under the same license. Changes: descriptions were converted
+from HTML to Markdown and fields not used for hover text were removed.
