@@ -145,8 +145,6 @@ tasks.register("packageApp") {
             commandLine(
                 java.absolutePath,
                 "-XX:AOTCacheOutput=" + File(appDir, "processingcli.aot").absolutePath,
-                // Linked classes have no code source, which breaks PApplet.calcSketchPath
-                "-XX:-AOTClassLinking",
                 "-Xlog:all=error",
                 "-cp", File(appDir, jar.name).absolutePath,
                 "org.konpeki.Main",

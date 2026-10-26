@@ -1,7 +1,9 @@
 package org.konpeki;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
+import java.io.PrintStream;
 import java.net.URL;
 import java.net.URLClassLoader;
 import java.nio.file.DirectoryStream;
@@ -112,7 +114,25 @@ public class Runner {
         if (present) args.add("--present");
         args.add(className);
         args.addAll(sketchArgs);
-        PApplet.runSketch(args.toArray(String[]::new), sketch);
+
+        // Hide calcSketchPath's NPE, PApplet's code source is null when loaded from the AOT cache
+        PrintStream err = System.err;
+        ByteArrayOutputStream captured = new ByteArrayOutputStream();
+        System.setErr(new PrintStream(captured, true));
+        try {
+            PApplet.runSketch(args.toArray(String[]::new), sketch);
+        } finally {
+            System.setErr(err);
+            boolean skipping = false;
+            for (String line : captured.toString().lines().toList()) {
+                if (line.contains("\"jarURL\" is null")) {
+                    skipping = true;
+                } else if (!skipping || !line.startsWith("\tat ")) {
+                    skipping = false;
+                    err.println(line);
+                }
+            }
+        }
     }
 
     public static void cleanUpInBackground() {
