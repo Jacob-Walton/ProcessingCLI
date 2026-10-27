@@ -65,6 +65,15 @@ public class Main implements Callable<Integer> {
     static void main(String[] args) throws Exception {
         restoreJarTime();
 
+        // Cloud synced and some network drives make every file a reparse point, which Java won't
+        // treat as a file, so javac can't read its own runtime
+        Path modules = Path.of(System.getProperty("java.home"), "lib", "modules");
+        if (!Files.isRegularFile(modules)) {
+            System.err.println("ProcessingCLI can't run from " + modules.getRoot()
+                    + ", move it to a folder on this computer, like %LOCALAPPDATA%\\ProcessingCLI");
+            System.exit(1);
+        }
+
         if (args.length > 0 && args[0].equals("lsp")) {
             Lsp.run();
             return;
