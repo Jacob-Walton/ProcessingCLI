@@ -11,6 +11,7 @@ import java.io.InputStreamReader;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.IntBuffer;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
@@ -40,6 +41,8 @@ public class Preview {
     private final ServerSocketChannel server;
     private final Object writing = new Object();
     private volatile SocketChannel client;
+    // The preview asked for run-length encoded frames, older ones only read raw pixels
+    private volatile SocketChannel compressing;
     private volatile PApplet sketch;
     private volatile CountDownLatch stopped = new CountDownLatch(0);
     private volatile String status = "starting";
@@ -192,21 +195,42 @@ public class Preview {
                 slot = buffers[0] != null && buffers[0] == sending ? 1 : 0;
                 if (waiting == buffers[slot]) waiting = null;
             }
-            // Binary WebSocket message: pixelWidth, pixelHeight, width, height, then ARGB ints (BGRA bytes)
-            int payload = 16 + pw * ph * 4;
-            if (buffers[slot] == null || buffers[slot].capacity() < 10 + payload) {
-                buffers[slot] = ByteBuffer.allocateDirect(10 + payload);
+            // Binary WebSocket message: pixelWidth, pixelHeight, width, height, then ARGB ints (BGRA bytes).
+            // The top bit of pixelWidth marks run-length encoded pixels, see encode
+            boolean packed = session.compressing == channel;
+            // Room for the longest WebSocket header, and encoding never takes more than one int over the raw pixels
+            int capacity = 10 + 16 + (pw * ph + 1) * 4;
+            if (buffers[slot] == null || buffers[slot].capacity() < capacity) {
+                buffers[slot] = ByteBuffer.allocateDirect(capacity);
             }
             ByteBuffer frame = buffers[slot];
-            frame.clear();
-            frame.order(ByteOrder.BIG_ENDIAN).put((byte) 0x82).put((byte) 127).putLong(payload);
+            frame.clear().position(10);
             frame.order(ByteOrder.LITTLE_ENDIAN)
-                    .putInt(pw)
+                    .putInt(packed ? pw | 0x80000000 : pw)
                     .putInt(ph)
                     .putInt(owner.width)
                     .putInt(owner.height);
-            frame.asIntBuffer().put(pixels, 0, pw * ph);
-            frame.position(10 + payload).flip();
+            IntBuffer ints = frame.asIntBuffer();
+            int count = packed
+                    ? encode(pixels, pw * ph, ints)
+                    : ints.put(pixels, 0, pw * ph).position();
+            int payload = 16 + count * 4;
+            // Browsers drop the connection unless the length takes as few bytes as it can, so the header
+            // goes just before the payload once its size is known
+            frame.order(ByteOrder.BIG_ENDIAN);
+            int start;
+            if (payload < 126) {
+                start = 8;
+                frame.put(start + 1, (byte) payload);
+            } else if (payload < 65536) {
+                start = 6;
+                frame.put(start + 1, (byte) 126).putShort(start + 2, (short) payload);
+            } else {
+                start = 0;
+                frame.put(start + 1, (byte) 127).putLong(start + 2, payload);
+            }
+            frame.put(start, (byte) 0x82);
+            frame.limit(10 + payload).position(start);
 
             boolean first = !announced;
             announced = true;
@@ -243,6 +267,29 @@ public class Preview {
                     waiting = null;
                 }
             }
+        }
+
+        // A run of one colour as [count, colour], anything else as [-count, colours...]. Most sketches are
+        // big areas of one colour, and some PCs can't send raw frames over localhost fast enough
+        static int encode(int[] pixels, int length, IntBuffer out) {
+            int i = 0;
+            while (i < length) {
+                int colour = pixels[i];
+                int end = i + 1;
+                while (end < length && pixels[end] == colour) end++;
+                if (end - i >= 3) {
+                    out.put(end - i).put(colour);
+                    i = end;
+                    continue;
+                }
+                // Different colours up to the next run of three
+                int start = i;
+                while (i < length && !(i + 2 < length && pixels[i] == pixels[i + 1] && pixels[i] == pixels[i + 2])) {
+                    i++;
+                }
+                out.put(start - i).put(pixels, start, i - start);
+            }
+            return out.position();
         }
 
         // Java2D draws into a BufferedImage, read it directly instead of copying through loadPixels
@@ -347,7 +394,8 @@ public class Preview {
                 for (int i = 0; i < payload.length; i++) payload[i] ^= mask[i & 3];
 
                 if (opcode == 8) break;
-                if (opcode == 2) handle(ByteBuffer.wrap(payload));
+                if (opcode == 2 && payload.length == 1 && payload[0] == 'C') compressing = channel;
+                else if (opcode == 2) handle(ByteBuffer.wrap(payload));
             }
         } catch (IOException ignored) {
             // Preview closed or reloading
