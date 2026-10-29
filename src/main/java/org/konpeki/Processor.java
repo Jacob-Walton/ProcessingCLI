@@ -72,6 +72,21 @@ public class Processor {
         return source.toString();
     }
 
+    // process() would blame the wrong tab
+    public void checkBraces() throws IOException {
+        for (Path p : paths) {
+            String text = Files.readString(p);
+            Braces.Unmatched unmatched = Braces.find(text);
+            if (unmatched == null) continue;
+            int line = (int) text.substring(0, unmatched.offset())
+                            .chars()
+                            .filter(c -> c == '\n')
+                            .count()
+                    + 1;
+            throw new IllegalStateException(p.getFileName() + ":" + line + ": " + unmatched.message());
+        }
+    }
+
     public String process(String source) throws Exception {
         StringWriter out = new StringWriter();
         // Don't read Processing's preferences.txt, may not exist

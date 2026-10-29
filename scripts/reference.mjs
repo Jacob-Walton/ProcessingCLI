@@ -33,7 +33,7 @@ for (const file of readdirSync(source).filter((f) => f.endsWith('.json')).sort()
 		name: entry.name,
 		description: markdown(entry.description || entry.brief),
 		syntax: entry.syntax ?? entry.constructors ?? [],
-		parameters: (entry.parameters ?? []).map((p) => ({ name: p.name, description: markdown(p.description) })),
+		parameters: (entry.parameters ?? []).map((p) => ({ name: p.name, description: markdown(p.description), type: p.type ?? [] })),
 		returns: entry.returns ?? '',
 	};
 }

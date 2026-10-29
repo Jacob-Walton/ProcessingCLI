@@ -17,14 +17,15 @@ import processing.utils.SketchException;
         name = "ProcessingCLI",
         mixinStandardHelpOptions = true,
         versionProvider = Main.Version.class,
-        description = "Preprocesses, compiles, and runs a Processing sketch.")
+        description = "Preprocesses, compiles, and runs a Processing sketch.",
+        footer = "%nTo format sketches: ProcessingCLI format [--check] FILE|SKETCH...")
 public class Main implements Callable<Integer> {
 
-    // jpackage sets this from the build's version
+    // Set by packageApp
     static class Version implements CommandLine.IVersionProvider {
         @Override
         public String[] getVersion() {
-            return new String[] {"ProcessingCLI " + System.getProperty("jpackage.app-version", "dev")};
+            return new String[] {"ProcessingCLI " + System.getProperty("processingcli.version", "dev")};
         }
     }
 
@@ -52,6 +53,9 @@ public class Main implements Callable<Integer> {
             description = "Sketchbook folder for contributed libraries (default: Processing's own setting).")
     Path sketchbook;
 
+    @Option(names = "--export", description = "Build a standalone app of the sketch for this platform.")
+    boolean export;
+
     @Option(names = "--bench", description = "Print startup timings and exit after the first frame.")
     boolean bench;
 
@@ -65,8 +69,7 @@ public class Main implements Callable<Integer> {
     static void main(String[] args) throws Exception {
         restoreJarTime();
 
-        // Cloud synced and some network drives make every file a reparse point, which Java won't
-        // treat as a file, so javac can't read its own runtime
+        // Cloud drives make files reparse points, javac can't read its runtime from them
         Path modules = Path.of(System.getProperty("java.home"), "lib", "modules");
         if (!Files.isRegularFile(modules)) {
             System.err.println("ProcessingCLI can't run from " + modules.getRoot()
@@ -74,6 +77,13 @@ public class Main implements Callable<Integer> {
             System.exit(1);
         }
 
+        if (args.length > 0 && args[0].equals("debug")) {
+            Debug.run();
+            return;
+        }
+        if (args.length > 0 && args[0].equals("format")) {
+            System.exit(Format.run(List.of(args).subList(1, args.length)));
+        }
         if (args.length > 0 && args[0].equals("lsp")) {
             Lsp.run();
             return;
@@ -136,6 +146,8 @@ public class Main implements Callable<Integer> {
     public Integer call() throws Exception {
         if (bench) Bench.enable();
         Bench.mark("main");
+        // "." has no folder name
+        sketch = sketch.toAbsolutePath().normalize();
 
         Runner.cleanUpInBackground();
 
@@ -168,6 +180,7 @@ public class Main implements Callable<Integer> {
             Path classes = Runner.cacheDir(sketch);
             String stamp = Runner.stamp(name, everything.toString(), libs);
             if (noCache || !Runner.isCompiled(classes, stamp)) {
+                processor.checkBraces();
                 String code = processor.process(source);
                 Bench.mark("processed");
                 Runner.compile(name, Preview.hideable(code), javaTabs, classes, stamp, libs);
@@ -176,6 +189,10 @@ public class Main implements Callable<Integer> {
                 Bench.mark("cache-hit");
             }
 
+            if (export) {
+                System.out.println("Exported to " + Export.write(sketch, name, classes, libs));
+                return true;
+            }
             Runner.launch(name, classes, sketch, libs, present, sketchArgs);
             Bench.mark("launched");
             launched = true;

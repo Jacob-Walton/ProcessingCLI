@@ -6,6 +6,7 @@ import com.sun.source.tree.IdentifierTree;
 import com.sun.source.tree.ImportTree;
 import com.sun.source.tree.MemberSelectTree;
 import com.sun.source.tree.MethodTree;
+import com.sun.source.tree.NewClassTree;
 import com.sun.source.tree.Scope;
 import com.sun.source.tree.Tree;
 import com.sun.source.tree.VariableTree;
@@ -31,13 +32,17 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.ElementKind;
+import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.Modifier;
 import javax.lang.model.element.PackageElement;
 import javax.lang.model.element.TypeElement;
 import javax.lang.model.type.DeclaredType;
+import javax.lang.model.type.ExecutableType;
 import javax.lang.model.type.TypeKind;
 import javax.lang.model.type.TypeMirror;
+import javax.lang.model.util.ElementFilter;
 import javax.lang.model.util.Elements;
+import javax.lang.model.util.Types;
 import javax.tools.Diagnostic;
 import javax.tools.DiagnosticCollector;
 import javax.tools.JavaFileObject;
@@ -73,9 +78,17 @@ final class Analysis {
     private CompilationUnitTree unit;
     private Trees trees;
     private Elements elements;
+    private Types types;
 
     private Analysis(String className) {
         this.className = className;
+    }
+
+    // Tab text as analysed
+    String text(Path file) {
+        for (Tab tab : tabs) if (tab.file.equals(file)) return tab.text;
+        for (JavaTab tab : javaTabs) if (tab.file.equals(file)) return tab.text;
+        return null;
     }
 
     List<Path> files() {
@@ -106,6 +119,16 @@ final class Analysis {
     }
 
     private void analyze(String combined, Path dir, StandardJavaFileManager files) throws IOException {
+        for (Tab tab : tabs) {
+            Braces.Unmatched unmatched = Braces.find(tab.text);
+            if (unmatched != null) {
+                Spot spot = combinedSpot(tab.start + unmatched.offset());
+                problems.add(
+                        new Problem(spot, combinedSpot(tab.start + unmatched.offset() + 1), unmatched.message(), true));
+            }
+        }
+        // Preprocessor errors would blame the wrong tab
+        if (!problems.isEmpty()) return;
         PreprocessorResult result;
         try {
             result = PdePreprocessor.builderFor(className).setTabSize(2).build().write(new StringWriter(), combined);
@@ -173,6 +196,7 @@ final class Analysis {
         task.analyze();
         trees = Trees.instance(task);
         elements = task.getElements();
+        types = task.getTypes();
 
         for (Diagnostic<? extends JavaFileObject> d : diagnostics.getDiagnostics()) {
             if (d.getKind() == Diagnostic.Kind.NOTE) continue;
@@ -257,8 +281,10 @@ final class Analysis {
                 int type = element == null ? -1 : tokenType(element);
                 if (type < 0) return;
                 Spot spot = scanned == unit ? javaSpot((int) offset) : tabSpot(javaUnits.get(scanned), (int) offset);
-                // Skips code the preprocessor added or moved, like size() going into settings()
-                if (!spot.file().equals(file) || !name.equals(textAt(spot, name.length()))) return;
+                // size() and co. get moved into settings()
+                if (scanned == unit && !name.equals(textAt(spot, name.length()))) spot = movedSpot((int) offset, file);
+                // Skips code the preprocessor added
+                if (spot == null || !spot.file().equals(file) || !name.equals(textAt(spot, name.length()))) return;
                 int modifiers = (declaration ? 1 : 0)
                         | (element.getModifiers().contains(Modifier.STATIC) ? 2 : 0)
                         | (element.getModifiers().contains(Modifier.FINAL)
@@ -310,20 +336,119 @@ final class Analysis {
     }
 
     String hover(Path file, int line, int column) {
+        Element element = elementAt(file, line, column);
+        if (element == null) return null;
+        String docs = docs(element);
+        // Sketch methods only
+        ExecutableElement parent = trees.getPath(element) == null ? null : overridden(element);
+        if (parent != null) {
+            boolean implementing = parent.getModifiers().contains(Modifier.ABSTRACT);
+            String note = (implementing ? "Implements `" : "Overrides `")
+                    + parent.getEnclosingElement().getSimpleName() + "." + parent.getSimpleName() + "`";
+            docs = docs == null ? note : note + "\n\n" + docs;
+        }
+        return Reference.hover(element, className, docs);
+    }
+
+    // What this overrides, not counting PApplet
+    ExecutableElement overridden(Element element) {
+        if (!(element instanceof ExecutableElement method)
+                || element.getKind() != ElementKind.METHOD
+                || !(method.getEnclosingElement() instanceof TypeElement owner)) return null;
+        List<TypeMirror> pending = new ArrayList<>(types.directSupertypes(owner.asType()));
+        while (!pending.isEmpty()) {
+            TypeMirror next = pending.removeFirst();
+            if (!(types.asElement(next) instanceof TypeElement type)) continue;
+            if (type.getQualifiedName().contentEquals("processing.core.PApplet")) continue;
+            for (ExecutableElement candidate : ElementFilter.methodsIn(type.getEnclosedElements())) {
+                if (elements.overrides(method, candidate, owner)) return candidate;
+            }
+            pending.addAll(types.directSupertypes(next));
+        }
+        return null;
+    }
+
+    private Element elementAt(Path file, int line, int column) {
         TreePath path = pathAt(file, line, column);
-        Element element = path == null ? null : trees.getElement(path);
-        return element == null ? null : Reference.hover(element, className);
+        if (path == null) return null;
+        TreePath parent = path.getParentPath();
+        if (parent != null
+                && parent.getLeaf() instanceof NewClassTree created
+                && created.getIdentifier() == path.getLeaf()) {
+            Element constructor = trees.getElement(parent);
+            if (constructor != null) return constructor;
+        }
+        return trees.getElement(path);
+    }
+
+    // Reference docs, then doc comments
+    String docs(Element element) {
+        String reference = Reference.docs(element);
+        if (reference != null) return reference;
+        Javadoc doc = javadoc(element);
+        // Empty or {@inheritDoc}, use the parent
+        if (doc != null && !doc.description().isBlank()) return doc.markdown();
+        ExecutableElement parent = overridden(element);
+        if (parent != null) return docs(parent);
+        return doc == null ? null : doc.markdown();
+    }
+
+    String summary(Element element) {
+        String reference = Reference.summary(element);
+        if (reference != null) return reference;
+        Javadoc doc = javadoc(element);
+        if (doc != null && !doc.description().isBlank()) return doc.description();
+        ExecutableElement parent = overridden(element);
+        return parent == null ? null : summary(parent);
+    }
+
+    // Names and descriptions from @param where compiled code has none
+    List<Reference.Parameter> parameters(ExecutableElement method) {
+        Javadoc doc = javadoc(method);
+        if (doc == null || doc.params().isEmpty()) {
+            ExecutableElement parent = overridden(method);
+            if (parent != null) doc = javadoc(parent);
+        }
+        List<Reference.Parameter> own = Reference.parameters(method);
+        if (doc != null
+                && doc.params().size() == own.size()
+                && own.stream().allMatch(p -> p.name().matches("arg\\d+"))) {
+            List<String> names = List.copyOf(doc.params().keySet());
+            List<Reference.Parameter> named = new ArrayList<>();
+            for (int i = 0; i < own.size(); i++) {
+                named.add(new Reference.Parameter(
+                        names.get(i), own.get(i).description(), own.get(i).type()));
+            }
+            own = named;
+        }
+        Javadoc found = doc;
+        return own.stream()
+                .map(p -> p.description() != null
+                                || found == null
+                                || !found.params().containsKey(p.name())
+                        ? p
+                        : new Reference.Parameter(p.name(), found.params().get(p.name()), p.type()))
+                .toList();
+    }
+
+    // Sketch source, or the index for compiled code
+    private Javadoc javadoc(Element element) {
+        if (elements == null) return null;
+        String comment = elements.getDocComment(element);
+        return Javadoc.parse(comment != null ? comment : DocIndex.comment(element));
     }
 
     Spot definition(Path file, int line, int column) {
-        TreePath path = pathAt(file, line, column);
-        Element element = path == null ? null : trees.getElement(path);
-        TreePath declaration = element == null ? null : trees.getPath(element);
-        if (declaration == null) return null;
+        Element element = elementAt(file, line, column);
+        if (element == null) return null;
+        TreePath declaration = trees.getPath(element);
+        // Compiled code
+        if (declaration == null) return Sources.locate(element);
         CompilationUnitTree in = declaration.getCompilationUnit();
         if (in != unit && !javaUnits.containsKey(in)) return null;
-        int offset =
-                nameOffset(in, declaration.getLeaf(), element.getSimpleName().toString());
+        // Constructors are named <init>
+        Element named = element.getKind() == ElementKind.CONSTRUCTOR ? element.getEnclosingElement() : element;
+        int offset = nameOffset(in, declaration.getLeaf(), named.getSimpleName().toString());
         if (offset < 0) return null;
         return in == unit ? javaSpot(offset) : tabSpot(javaUnits.get(in), offset);
     }
@@ -334,7 +459,7 @@ final class Analysis {
     // The text to analyse for completion, and whether it's after a dot
     record Patch(String text, boolean member) {}
 
-    private static final String HERE = "__here", TYPE = "__type";
+    private static final String HERE = "__here", TYPE = "__type", SUPER = "__super";
 
     // Swaps the line being typed for declarations that always parse. One holds the expression
     // before the dot, or null, and gives the scope. The other reads it as a type, for PVector.
@@ -356,11 +481,36 @@ final class Analysis {
             String receiver = before.substring(start, dot - 1).strip();
             if (receiver.isEmpty() || receiver.matches("\\d+")) return null;
             stand = "Object " + HERE + " = (" + receiver + ");";
-            if (receiver.matches("[\\w.]+")) stand += " " + receiver + " " + TYPE + ";";
+            // super isn't a value
+            if (receiver.equals("super")) stand = "Object " + HERE + " = this; Object " + SUPER + " = null;";
+            else if (receiver.matches("[\\w.]+") && !receiver.equals("this"))
+                stand += " " + receiver + " " + TYPE + ";";
         }
-        String braces =
-                braces(before.substring(0, start)) + " " + stand + " " + braces(current.substring(before.length()));
-        return new Patch(text.substring(0, starts[line]) + braces + text.substring(lineEnd), member);
+        // Keep earlier statements, like the for in for (Ball b : balls) { b.
+        String head = before.substring(0, start);
+        int kept = statementsEnd(head);
+        String patched = head.substring(0, kept) + " " + braces(head.substring(kept)) + " " + stand + " "
+                + braces(current.substring(before.length()));
+        return new Patch(text.substring(0, starts[line]) + patched + text.substring(lineEnd), member);
+    }
+
+    // End of the last statement or {, not counting for (;;)
+    private static int statementsEnd(String text) {
+        int depth = 0, end = 0;
+        char quote = 0;
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (quote != 0) {
+                if (c == '\\') i++;
+                else if (c == quote) quote = 0;
+                continue;
+            }
+            if (c == '"' || c == '\'') quote = c;
+            else if (c == '(' || c == '[') depth++;
+            else if (c == ')' || c == ']') depth--;
+            else if (depth == 0 && (c == ';' || c == '{' || c == '}')) end = i + 1;
+        }
+        return end;
     }
 
     private static boolean inCommentOrString(String text) {
@@ -402,15 +552,146 @@ final class Analysis {
         return text.replaceAll("[^{}]", "");
     }
 
-    // Names in scope at the patched line, or members of what's before the dot
     List<Completion> completions(boolean member) {
+        Map<String, List<Element>> names = names(member);
+        if (names == null) return List.of(new Completion("length", null, 1));
+        List<Completion> completions = new ArrayList<>();
+        names.forEach((key, list) -> completions.add(
+                new Completion(list.getFirst().getSimpleName().toString(), list.getFirst(), list.size())));
+        return completions;
+    }
+
+    // Call the cursor is in
+    record Call(int line, int column, String name, boolean constructor, int argument) {}
+
+    private static final Set<String> NOT_CALLS =
+            Set.of("if", "for", "while", "switch", "catch", "synchronized", "return");
+
+    static Call call(String text, int line, int column) {
+        int[] starts = lineStarts(text);
+        if (line >= starts.length) return null;
+        int at = Math.min(starts[line] + column, text.length());
+        int depth = 0, argument = 0;
+        for (int i = at - 1; i >= 0; i--) {
+            char c = text.charAt(i);
+            if (c == '"' || c == '\'') {
+                int open = text.lastIndexOf(c, i - 1);
+                if (open < 0) return null;
+                i = open;
+            } else if (c == ')' || c == ']') {
+                depth++;
+            } else if (c == '(' || c == '[') {
+                if (depth-- > 0) continue;
+                if (c == '[') return null;
+                int end = i;
+                while (end > 0 && Character.isWhitespace(text.charAt(end - 1))) end--;
+                int start = end;
+                while (start > 0 && Character.isJavaIdentifierPart(text.charAt(start - 1))) start--;
+                String name = text.substring(start, end);
+                if (name.isEmpty() || NOT_CALLS.contains(name)) return null;
+                String rest = text.substring(0, start).stripTrailing();
+                boolean constructor = rest.endsWith("new")
+                        && (rest.length() == 3 || !Character.isJavaIdentifierPart(rest.charAt(rest.length() - 4)));
+                int nameLine = 0;
+                while (nameLine + 1 < starts.length && starts[nameLine + 1] <= start) nameLine++;
+                return new Call(nameLine, start - starts[nameLine], name, constructor, argument);
+            } else if (depth == 0 && c == ',') {
+                argument++;
+            } else if (depth == 0 && (c == ';' || c == '{' || c == '}')) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    // Methods a call could mean
+    List<ExecutableElement> callables(boolean member, Call call) {
+        Map<String, List<Element>> names = names(member);
+        if (names == null) return List.of();
+        if (!call.constructor()) {
+            return names.getOrDefault(call.name() + "()", List.of()).stream()
+                    .map(ExecutableElement.class::cast)
+                    .toList();
+        }
+        for (Element e : names.getOrDefault(call.name(), List.of())) {
+            if (e instanceof TypeElement type) {
+                return ElementFilter.constructorsIn(type.getEnclosedElements()).stream()
+                        .filter(c -> !c.getModifiers().contains(Modifier.PRIVATE))
+                        .toList();
+            }
+        }
+        return List.of();
+    }
+
+    // Processing calls these on the sketch
+    private static final Set<String> CALLBACKS = Set.of(
+            "settings",
+            "setup",
+            "draw",
+            "mousePressed",
+            "mouseReleased",
+            "mouseClicked",
+            "mouseMoved",
+            "mouseDragged",
+            "mouseWheel",
+            "keyPressed",
+            "keyReleased",
+            "keyTyped");
+
+    // inPde: Processing makes it public anyway
+    record Overridable(ExecutableElement method, List<TypeMirror> parameterTypes, boolean sketch, boolean inPde) {}
+
+    // Inherited methods not yet overridden
+    List<Overridable> overridable() {
         if (unit == null) return List.of();
-        TreePath[] found = new TreePath[2];
+        TreePath[] here = new TreePath[1];
+        TreePathScanner<Void, Void> finder = new TreePathScanner<>() {
+            @Override
+            public Void visitVariable(VariableTree tree, Void unused) {
+                if (tree.getName().contentEquals(HERE)) here[0] = getCurrentPath();
+                return super.visitVariable(tree, unused);
+            }
+        };
+        finder.scan(unit, null);
+        for (CompilationUnitTree tab : javaUnits.keySet()) finder.scan(tab, null);
+        if (here[0] == null || !(here[0].getParentPath().getLeaf() instanceof ClassTree)) return List.of();
+        if (!(trees.getElement(here[0].getParentPath()) instanceof TypeElement owner)) return List.of();
+
+        boolean sketch = owner.getQualifiedName().contentEquals(className);
+        boolean inPde = here[0].getCompilationUnit() == unit;
+        List<Overridable> found = new ArrayList<>();
+        // Overridden ones are this class's
+        for (ExecutableElement method : ElementFilter.methodsIn(elements.getAllMembers(owner))) {
+            if (!(method.getEnclosingElement() instanceof TypeElement from) || from.equals(owner)) continue;
+            Set<Modifier> modifiers = method.getModifiers();
+            if (modifiers.contains(Modifier.FINAL)
+                    || modifiers.contains(Modifier.STATIC)
+                    || modifiers.contains(Modifier.PRIVATE)) continue;
+            String name = method.getSimpleName().toString();
+            String declared = from.getQualifiedName().toString();
+            if (declared.equals("java.lang.Object")
+                    && (sketch || !Set.of("toString", "equals", "hashCode").contains(name))) continue;
+            if (declared.startsWith("processing.") && !CALLBACKS.contains(name)) continue;
+            List<TypeMirror> parameterTypes =
+                    method.getParameters().stream().map(Element::asType).toList();
+            if (types.asMemberOf((DeclaredType) owner.asType(), method) instanceof ExecutableType member) {
+                parameterTypes = List.copyOf(member.getParameterTypes());
+            }
+            found.add(new Overridable(method, parameterTypes, sketch, inPde));
+        }
+        return found;
+    }
+
+    // Names in scope, or members after a dot. Null for arrays
+    private Map<String, List<Element>> names(boolean member) {
+        if (unit == null) return Map.of();
+        TreePath[] found = new TreePath[3];
         TreePathScanner<Void, Void> finder = new TreePathScanner<>() {
             @Override
             public Void visitVariable(VariableTree tree, Void unused) {
                 if (tree.getName().contentEquals(HERE)) found[0] = getCurrentPath();
                 if (tree.getName().contentEquals(TYPE)) found[1] = getCurrentPath();
+                if (tree.getName().contentEquals(SUPER)) found[2] = getCurrentPath();
                 return super.visitVariable(tree, unused);
             }
         };
@@ -420,7 +701,7 @@ final class Analysis {
         Map<String, List<Element>> names = new LinkedHashMap<>();
         if (found[0] == null) {
             // The line couldn't be patched, this is the last good analysis
-            if (member || unit.getTypeDecls().isEmpty()) return List.of();
+            if (member || unit.getTypeDecls().isEmpty()) return Map.of();
             TreePath sketch =
                     new TreePath(new TreePath(unit), unit.getTypeDecls().getFirst());
             inScope(names, null, (TypeElement) trees.getElement(sketch), unit);
@@ -428,12 +709,9 @@ final class Analysis {
             TreePath value = new TreePath(found[0], ((VariableTree) found[0].getLeaf()).getInitializer());
             Scope scope = trees.getScope(value);
             if (!member) inScope(names, scope, scope.getEnclosingClass(), found[0].getCompilationUnit());
-            else if (!membersOf(names, scope, value, found[1])) return List.of(new Completion("length", null, 1));
+            else if (!membersOf(names, scope, value, found[1], found[2] != null)) return null;
         }
-        List<Completion> completions = new ArrayList<>();
-        names.forEach((key, list) -> completions.add(
-                new Completion(list.getFirst().getSimpleName().toString(), list.getFirst(), list.size())));
-        return completions;
+        return names;
     }
 
     private void inScope(Map<String, List<Element>> names, Scope scope, TypeElement inside, CompilationUnitTree in) {
@@ -470,8 +748,9 @@ final class Analysis {
     }
 
     // False when the receiver is an array
-    private boolean membersOf(Map<String, List<Element>> names, Scope scope, TreePath value, TreePath type) {
-        TypeMirror mirror = trees.getTypeMirror(value);
+    private boolean membersOf(
+            Map<String, List<Element>> names, Scope scope, TreePath value, TreePath type, boolean viaSuper) {
+        TypeMirror mirror = viaSuper ? scope.getEnclosingClass().getSuperclass() : trees.getTypeMirror(value);
         boolean statics = false;
         if (mirror != null && mirror.getKind() == TypeKind.ARRAY) return false;
         if (mirror == null || mirror.getKind() != TypeKind.DECLARED) {
@@ -488,6 +767,8 @@ final class Analysis {
             boolean isStatic = e.getModifiers().contains(Modifier.STATIC)
                     || e.getKind().isClass()
                     || e.getKind().isInterface();
+            // super.show() can't call an abstract show()
+            if (viaSuper && e.getModifiers().contains(Modifier.ABSTRACT)) continue;
             if (isStatic == statics && trees.isAccessible(scope, e, declared)) add(names, e);
         }
         return true;
@@ -499,6 +780,10 @@ final class Analysis {
         String name = e.getSimpleName().toString();
         ElementKind kind = e.getKind();
         if (name.isEmpty() || name.startsWith("__") || name.equals("this") || name.equals("super")) return;
+        // Never wanted
+        if ((name.equals("clone") || name.equals("finalize"))
+                && e.getEnclosingElement() instanceof TypeElement owner
+                && owner.getQualifiedName().contentEquals("java.lang.Object")) return;
         if (kind == ElementKind.CONSTRUCTOR || kind == ElementKind.STATIC_INIT || kind == ElementKind.INSTANCE_INIT)
             return;
         // Package-private types from imports
@@ -518,6 +803,11 @@ final class Analysis {
                 && !UNDOCUMENTED.contains(name)) return;
         names.computeIfAbsent(name + (kind == ElementKind.METHOD ? "()" : ""), k -> new ArrayList<>())
                 .add(e);
+    }
+
+    // Shape rather than Sketch.Shape
+    String type(TypeMirror type) {
+        return Reference.type(type).replace(className + ".", "");
     }
 
     String signature(Element element) {
@@ -645,6 +935,22 @@ final class Analysis {
             }
         }
         return spot;
+    }
+
+    // Where a statement moved into settings() was written
+    private Spot movedSpot(int javaOffset, Path file) {
+        // settings() is all on one line
+        int start = Math.max(java.lastIndexOf('{', javaOffset), java.lastIndexOf(';', javaOffset)) + 1;
+        int end = java.indexOf(';', javaOffset);
+        if (end < 0) return null;
+        String statement = java.substring(start, end + 1).strip();
+        start = java.indexOf(statement, start);
+        for (Tab tab : tabs) {
+            if (!tab.file.equals(file)) continue;
+            int at = tab.text.indexOf(statement);
+            return at < 0 ? null : tabSpot(new JavaTab(tab.file, tab.text, tab.lineStarts), at + javaOffset - start);
+        }
+        return null;
     }
 
     // Where a .pde position is in the generated Java

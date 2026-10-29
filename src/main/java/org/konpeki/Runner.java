@@ -33,6 +33,10 @@ public class Runner {
     private static final Duration MAX_AGE = Duration.ofDays(30);
     private static StandardJavaFileManager files;
 
+    static Path cacheRoot() {
+        return CACHE_ROOT;
+    }
+
     public static Path cacheDir(Path sketchDir) throws Exception {
         String key = sketchDir.toAbsolutePath().normalize().toString().toLowerCase();
         return CACHE_ROOT.resolve(hash(key));
@@ -75,8 +79,17 @@ public class Runner {
                         libs.stream().map(Path::toString))
                 .collect(Collectors.joining(File.pathSeparator));
 
-        List<String> options =
-                List.of("-cp", classpath, "-d", classesDir.toString(), "-proc:none", "-implicit:none", "-nowarn");
+        List<String> options = List.of(
+                "-cp",
+                classpath,
+                "-d",
+                classesDir.toString(),
+                "-g",
+                "-proc:none",
+                "-implicit:none",
+                "-nowarn",
+                // "uses unchecked operations" notes
+                "-XDsuppressNotes");
         List<Path> sources = Stream.concat(Stream.of(file), javaTabs.stream()).toList();
         boolean compiled = compiler.getTask(
                         null, files, null, options, null, files.getJavaFileObjectsFromPaths(sources))

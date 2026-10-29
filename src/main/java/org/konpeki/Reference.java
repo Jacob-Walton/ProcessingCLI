@@ -18,7 +18,7 @@ import javax.lang.model.type.DeclaredType;
 import javax.lang.model.type.TypeMirror;
 
 final class Reference {
-    record Parameter(String name, String description) {}
+    record Parameter(String name, String description, List<String> type) {}
 
     record Entry(String name, String description, List<String> syntax, List<Parameter> parameters, String returns) {}
 
@@ -27,8 +27,7 @@ final class Reference {
 
     private static Map<String, Entry> entries;
 
-    static String hover(Element element, String className) {
-        String docs = docs(element);
+    static String hover(Element element, String className, String docs) {
         return "```java\n" + signature(element, className) + "\n```" + (docs == null ? "" : "\n\n" + docs);
     }
 
@@ -50,8 +49,53 @@ final class Reference {
     }
 
     static boolean documented(Element element) {
+        return entry(element) != null;
+    }
+
+    static String summary(Element element) {
+        Entry entry = entry(element);
+        return entry == null ? null : entry.description();
+    }
+
+    // Names from the syntax line with matching types, fill(int) is fill(rgb)
+    static List<Parameter> parameters(ExecutableElement method) {
+        List<Parameter> own = method.getParameters().stream()
+                .map(p -> new Parameter(p.getSimpleName().toString(), null, List.of()))
+                .toList();
+        Entry entry = entry(method);
+        if (entry == null) return own;
+        Map<String, Parameter> documented =
+                entry.parameters().stream().collect(Collectors.toMap(Parameter::name, p -> p, (a, b) -> a));
+        boolean named = own.stream().noneMatch(p -> p.name().matches("arg\\d+"));
+        List<Parameter> best = null;
+        int bestScore = -1;
+        for (String syntax : named ? List.<String>of() : entry.syntax()) {
+            int open = syntax.indexOf('('), close = syntax.lastIndexOf(')');
+            if (open < 0 || close < open) continue;
+            String inside = syntax.substring(open + 1, close).strip();
+            List<String> names = inside.isEmpty() ? List.of() : List.of(inside.split("\\s*,\\s*"));
+            if (names.size() != own.size()) continue;
+            int score = 0;
+            for (int i = 0; i < names.size(); i++) {
+                Parameter p = documented.get(names.get(i));
+                String type = type(method.getParameters().get(i).asType());
+                if (p != null && p.type() != null && p.type().contains(type)) score++;
+            }
+            if (score > bestScore) {
+                bestScore = score;
+                best = names.stream()
+                        .map(n -> documented.getOrDefault(n, new Parameter(n, null, List.of())))
+                        .toList();
+            }
+        }
+        if (best != null) return best;
+        // Real names, maybe described in the reference
+        return own.stream().map(p -> documented.getOrDefault(p.name(), p)).toList();
+    }
+
+    private static Entry entry(Element element) {
         String key = key(element);
-        return key != null && entries().containsKey(key);
+        return key == null ? null : entries().get(key);
     }
 
     // File names in the reference: ellipse_, mouseX, PVector, PVector_add_
@@ -112,7 +156,7 @@ final class Reference {
     }
 
     // processing.core.PVector -> PVector
-    private static String type(TypeMirror type) {
+    static String type(TypeMirror type) {
         return type.toString().replaceAll("\\b(?:[a-z_]\\w*\\.)+(?=[A-Z])", "");
     }
 

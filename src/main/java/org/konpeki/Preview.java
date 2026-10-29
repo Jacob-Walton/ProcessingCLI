@@ -41,7 +41,7 @@ public class Preview {
     private final ServerSocketChannel server;
     private final Object writing = new Object();
     private volatile SocketChannel client;
-    // The preview asked for run-length encoded frames, older ones only read raw pixels
+    // Preview asked for encoded frames
     private volatile SocketChannel compressing;
     private volatile PApplet sketch;
     private volatile CountDownLatch stopped = new CountDownLatch(0);
@@ -104,7 +104,7 @@ public class Preview {
                 + " surface = org.konpeki.Preview.surface(this, g);"
                 + " return surface; }\n"
                 + "  @Override protected void showSurface() {"
-                + " if (org.konpeki.Preview.shouldShow(this)) super.showSurface(); }\n"
+                + " if (org.konpeki.Preview.shouldShow(this)) org.konpeki.Tiling.show(this, super::showSurface); }\n"
                 + "  @Override public void exitActual() {"
                 + " if (!org.konpeki.Preview.stopped(this)) super.exitActual(); }\n"
                 + code.substring(end);
@@ -173,7 +173,7 @@ public class Preview {
         private final PApplet owner;
         private final ExecutorService sender =
                 Executors.newSingleThreadExecutor(Thread.ofPlatform().daemon().factory());
-        // Two buffers: while one frame sends, the next waits in the other instead of being dropped.
+        // Two buffers, a newer frame replaces a waiting one
         // A newer frame replaces a waiting one, so the preview never falls behind
         private final ByteBuffer[] buffers = new ByteBuffer[2];
         private ByteBuffer sending, waiting;
@@ -195,10 +195,9 @@ public class Preview {
                 slot = buffers[0] != null && buffers[0] == sending ? 1 : 0;
                 if (waiting == buffers[slot]) waiting = null;
             }
-            // Binary WebSocket message: pixelWidth, pixelHeight, width, height, then ARGB ints (BGRA bytes).
-            // The top bit of pixelWidth marks run-length encoded pixels, see encode
+            // pixelWidth, pixelHeight, width, height, then ARGB ints. Top bit of pixelWidth means encoded
             boolean packed = session.compressing == channel;
-            // Room for the longest WebSocket header, and encoding never takes more than one int over the raw pixels
+            // Longest header, and encoding adds at most one int
             int capacity = 10 + 16 + (pw * ph + 1) * 4;
             if (buffers[slot] == null || buffers[slot].capacity() < capacity) {
                 buffers[slot] = ByteBuffer.allocateDirect(capacity);
@@ -215,8 +214,7 @@ public class Preview {
                     ? encode(pixels, pw * ph, ints)
                     : ints.put(pixels, 0, pw * ph).position();
             int payload = 16 + count * 4;
-            // Browsers drop the connection unless the length takes as few bytes as it can, so the header
-            // goes just before the payload once its size is known
+            // Browsers need the shortest length encoding
             frame.order(ByteOrder.BIG_ENDIAN);
             int start;
             if (payload < 126) {
@@ -269,8 +267,7 @@ public class Preview {
             }
         }
 
-        // A run of one colour as [count, colour], anything else as [-count, colours...]. Most sketches are
-        // big areas of one colour, and some PCs can't send raw frames over localhost fast enough
+        // Runs as [count, colour], the rest as [-count, colours...]
         static int encode(int[] pixels, int length, IntBuffer out) {
             int i = 0;
             while (i < length) {
