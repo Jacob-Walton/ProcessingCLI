@@ -214,7 +214,8 @@ tasks.register("packageApp") {
                 "--main-jar", jar.name,
                 "--main-class", "org.konpeki.Main",
                 "--add-modules", modules.joinToString(","),
-                "--jlink-options", "--strip-debug --no-man-pages --no-header-files --generate-cds-archive",
+                // Debug info kept for the debugger's call stack
+                "--jlink-options", "--no-man-pages --no-header-files --generate-cds-archive",
                 "--java-options", javaOptions.joinToString(" "),
                 if (target == "windows") "--win-console" else null,
                 "--add-launcher", "Sketch=${sketchLauncher.absolutePath}",

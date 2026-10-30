@@ -23,6 +23,7 @@ import com.sun.jdi.event.ClassPrepareEvent;
 import com.sun.jdi.event.Event;
 import com.sun.jdi.event.EventSet;
 import com.sun.jdi.event.ExceptionEvent;
+import com.sun.jdi.event.ModificationWatchpointEvent;
 import com.sun.jdi.event.StepEvent;
 import com.sun.jdi.event.VMDeathEvent;
 import com.sun.jdi.event.VMDisconnectEvent;
@@ -32,6 +33,7 @@ import com.sun.jdi.request.ClassPrepareRequest;
 import com.sun.jdi.request.EventRequest;
 import com.sun.jdi.request.EventRequestManager;
 import com.sun.jdi.request.ExceptionRequest;
+import com.sun.jdi.request.ModificationWatchpointRequest;
 import com.sun.jdi.request.StepRequest;
 import java.io.BufferedReader;
 import java.io.FileDescriptor;
@@ -51,14 +53,23 @@ import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import org.eclipse.lsp4j.debug.Breakpoint;
+import org.eclipse.lsp4j.debug.BreakpointEventArguments;
+import org.eclipse.lsp4j.debug.BreakpointEventArgumentsReason;
 import org.eclipse.lsp4j.debug.Capabilities;
 import org.eclipse.lsp4j.debug.ConfigurationDoneArguments;
 import org.eclipse.lsp4j.debug.ContinueArguments;
 import org.eclipse.lsp4j.debug.ContinueResponse;
+import org.eclipse.lsp4j.debug.DataBreakpoint;
+import org.eclipse.lsp4j.debug.DataBreakpointAccessType;
+import org.eclipse.lsp4j.debug.DataBreakpointInfoArguments;
+import org.eclipse.lsp4j.debug.DataBreakpointInfoResponse;
 import org.eclipse.lsp4j.debug.DisconnectArguments;
 import org.eclipse.lsp4j.debug.EvaluateArguments;
 import org.eclipse.lsp4j.debug.EvaluateResponse;
+import org.eclipse.lsp4j.debug.ExceptionBreakMode;
 import org.eclipse.lsp4j.debug.ExceptionBreakpointsFilter;
+import org.eclipse.lsp4j.debug.ExceptionInfoArguments;
+import org.eclipse.lsp4j.debug.ExceptionInfoResponse;
 import org.eclipse.lsp4j.debug.ExitedEventArguments;
 import org.eclipse.lsp4j.debug.InitializeRequestArguments;
 import org.eclipse.lsp4j.debug.NextArguments;
@@ -70,10 +81,15 @@ import org.eclipse.lsp4j.debug.ScopesArguments;
 import org.eclipse.lsp4j.debug.ScopesResponse;
 import org.eclipse.lsp4j.debug.SetBreakpointsArguments;
 import org.eclipse.lsp4j.debug.SetBreakpointsResponse;
+import org.eclipse.lsp4j.debug.SetDataBreakpointsArguments;
+import org.eclipse.lsp4j.debug.SetDataBreakpointsResponse;
 import org.eclipse.lsp4j.debug.SetExceptionBreakpointsArguments;
 import org.eclipse.lsp4j.debug.SetExceptionBreakpointsResponse;
+import org.eclipse.lsp4j.debug.SetVariableArguments;
+import org.eclipse.lsp4j.debug.SetVariableResponse;
 import org.eclipse.lsp4j.debug.Source;
 import org.eclipse.lsp4j.debug.SourceBreakpoint;
+import org.eclipse.lsp4j.debug.SourcePresentationHint;
 import org.eclipse.lsp4j.debug.StackFramePresentationHint;
 import org.eclipse.lsp4j.debug.StackTraceArguments;
 import org.eclipse.lsp4j.debug.StackTraceResponse;
@@ -92,6 +108,9 @@ import org.eclipse.lsp4j.debug.launch.DSPLauncher;
 import org.eclipse.lsp4j.debug.services.IDebugProtocolClient;
 import org.eclipse.lsp4j.debug.services.IDebugProtocolServer;
 import org.eclipse.lsp4j.jsonrpc.Launcher;
+import org.eclipse.lsp4j.jsonrpc.ResponseErrorException;
+import org.eclipse.lsp4j.jsonrpc.messages.ResponseError;
+import org.eclipse.lsp4j.jsonrpc.messages.ResponseErrorCode;
 import processing.mode.java.preproc.PdePreprocessor;
 import processing.mode.java.preproc.PreprocessorResult;
 import processing.mode.java.preproc.TextTransform;
@@ -125,12 +144,29 @@ final class Debug implements IDebugProtocolServer {
     private Process debuggee;
     private Path sketch;
     private Lines lines;
-    private boolean uncaught = true;
+    private boolean uncaught = true, caught;
     private ExceptionRequest exceptions;
+    private final Map<Long, ObjectReference> thrown = new HashMap<>();
 
-    // Breakpoint lines by file, and their requests
-    private final Map<Path, List<Integer>> breakpoints = new HashMap<>();
+    private record Wanted(int id, int line, String condition, String hitCondition, String logMessage) {}
+
+    // Breakpoints by file, and their requests
+    private final Map<Path, List<Wanted>> breakpoints = new HashMap<>();
     private final Map<Path, List<BreakpointRequest>> requests = new HashMap<>();
+    // Where each one really is, a blank line breaks on the next code
+    private final Map<Integer, Integer> placedLines = new HashMap<>();
+    private final Map<BreakpointRequest, Integer> hits = new HashMap<>();
+    private int nextBreakpoint = 1;
+    // Conditions and logpoints run code in the sketch, so not on the event thread
+    private final java.util.concurrent.ExecutorService conditions =
+            java.util.concurrent.Executors.newSingleThreadExecutor(
+                    java.lang.Thread.ofPlatform().daemon().factory());
+
+    private record Watched(ObjectReference object, Field field) {}
+
+    private final Map<String, Watched> watchable = new HashMap<>();
+    private final List<ModificationWatchpointRequest> watchpoints = new ArrayList<>();
+    private ThreadReference lastStopped;
     private final Map<String, List<ReferenceType>> loaded = new HashMap<>();
 
     // Cleared on resume
@@ -159,14 +195,26 @@ final class Debug implements IDebugProtocolServer {
         capabilities.setSupportsConfigurationDoneRequest(true);
         capabilities.setSupportsEvaluateForHovers(true);
         capabilities.setSupportsTerminateRequest(true);
-        ExceptionBreakpointsFilter filter = new ExceptionBreakpointsFilter();
-        filter.setFilter("uncaught");
-        filter.setLabel("Uncaught exceptions");
-        filter.setDefault_(true);
-        capabilities.setExceptionBreakpointFilters(new ExceptionBreakpointsFilter[] {filter});
+        capabilities.setSupportsConditionalBreakpoints(true);
+        capabilities.setSupportsHitConditionalBreakpoints(true);
+        capabilities.setSupportsLogPoints(true);
+        capabilities.setSupportsSetVariable(true);
+        capabilities.setSupportsExceptionInfoRequest(true);
+        capabilities.setSupportsDataBreakpoints(true);
+        capabilities.setExceptionBreakpointFilters(new ExceptionBreakpointsFilter[] {
+            filter("uncaught", "Uncaught exceptions", true), filter("caught", "Caught exceptions", false)
+        });
         // After the response
         CompletableFuture.delayedExecutor(100, TimeUnit.MILLISECONDS).execute(() -> client.initialized());
         return CompletableFuture.completedFuture(capabilities);
+    }
+
+    private static ExceptionBreakpointsFilter filter(String id, String label, boolean on) {
+        ExceptionBreakpointsFilter filter = new ExceptionBreakpointsFilter();
+        filter.setFilter(id);
+        filter.setLabel(label);
+        filter.setDefault_(on);
+        return filter;
     }
 
     @Override
@@ -190,6 +238,8 @@ final class Debug implements IDebugProtocolServer {
         builder.environment()
                 .put("JAVA_TOOL_OPTIONS", "-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=127.0.0.1:0");
         debuggee = builder.start();
+        // Not left suspended if VS Code goes away without disconnecting
+        Runtime.getRuntime().addShutdownHook(new java.lang.Thread(this::stop));
 
         // The agent prints its port first
         BufferedReader out =
@@ -279,10 +329,22 @@ final class Debug implements IDebugProtocolServer {
                 EventSet set = vm.eventQueue().remove();
                 boolean resume = true;
                 for (Event event : set) {
+                    // Hit while evaluating something, the evaluation is waiting on it
+                    if (event instanceof com.sun.jdi.event.LocatableEvent located
+                            && Eval.evaluating.contains(located.thread())) {
+                        continue;
+                    }
                     switch (event) {
                         case ClassPrepareEvent prepare -> prepared(prepare.referenceType());
                         case BreakpointEvent hit -> {
-                            stopped(hit.thread(), StoppedEventArgumentsReason.BREAKPOINT, null);
+                            conditions.execute(() -> hit(hit, set));
+                            resume = false;
+                        }
+                        case ModificationWatchpointEvent changed -> {
+                            stopped(
+                                    changed.thread(),
+                                    StoppedEventArgumentsReason.DATA_BREAKPOINT,
+                                    changed.field().name() + " changed");
                             resume = false;
                         }
                         case StepEvent step -> {
@@ -290,11 +352,17 @@ final class Debug implements IDebugProtocolServer {
                             stopped(step.thread(), StoppedEventArgumentsReason.STEP, null);
                             resume = false;
                         }
-                        case ExceptionEvent thrown -> {
+                        // Caught ones only when the sketch catches them, the JDK catches plenty itself
+                        case ExceptionEvent exception
+                        when exception.catchLocation() != null && spot(exception.catchLocation()) == null -> {}
+                        case ExceptionEvent exception -> {
+                            synchronized (this) {
+                                thrown.put(exception.thread().uniqueID(), exception.exception());
+                            }
                             stopped(
-                                    thrown.thread(),
+                                    exception.thread(),
                                     StoppedEventArgumentsReason.EXCEPTION,
-                                    thrown.exception().referenceType().name());
+                                    exception.exception().referenceType().name());
                             resume = false;
                         }
                         // configurationDone resumes
@@ -325,8 +393,80 @@ final class Debug implements IDebugProtocolServer {
         client.terminated(new TerminatedEventArguments());
     }
 
+    // Hit counts, conditions and logpoints decide whether it stops
+    private void hit(BreakpointEvent event, EventSet set) {
+        BreakpointRequest request = (BreakpointRequest) event.request();
+        Wanted wanted = (Wanted) request.getProperty("wanted");
+        int count;
+        synchronized (this) {
+            count = hits.merge(request, 1, Integer::sum);
+        }
+        Eval.evaluating.add(event.thread());
+        try {
+            if (wanted != null && !hitCount(wanted.hitCondition(), count)) {
+                set.resume();
+                return;
+            }
+            Eval eval = new Eval(event.thread(), 0, lines.className);
+            if (wanted != null
+                    && wanted.condition() != null
+                    && !wanted.condition().isBlank()) {
+                Value result = eval.eval(wanted.condition());
+                if (!(result instanceof com.sun.jdi.BooleanValue b) || !b.value()) {
+                    set.resume();
+                    return;
+                }
+            }
+            if (wanted != null && wanted.logMessage() != null) {
+                output(interpolate(eval, wanted.logMessage()) + "\n", OutputEventArgumentsCategory.CONSOLE);
+                set.resume();
+                return;
+            }
+        } catch (Eval.Failure e) {
+            // A broken condition stops, so it can be fixed
+            output("Breakpoint condition: " + e.getMessage() + "\n", OutputEventArgumentsCategory.STDERR);
+        } finally {
+            Eval.evaluating.remove(event.thread());
+        }
+        stopped(event.thread(), StoppedEventArgumentsReason.BREAKPOINT, null);
+    }
+
+    // 5, >5, >=5 or %5, like other Java debuggers
+    private static boolean hitCount(String condition, int count) {
+        if (condition == null || condition.isBlank()) return true;
+        Matcher m = Pattern.compile("\\s*(>=|<=|>|<|==|%)?\\s*(\\d+)\\s*").matcher(condition);
+        if (!m.matches()) return true;
+        int n = Integer.parseInt(m.group(2));
+        String op = m.group(1) == null ? "==" : m.group(1);
+        return switch (op) {
+            case ">=" -> count >= n;
+            case "<=" -> count <= n;
+            case ">" -> count > n;
+            case "<" -> count < n;
+            case "%" -> n > 0 && count % n == 0;
+            default -> count == n;
+        };
+    }
+
+    // x is {x}, as a logpoint prints it
+    private static String interpolate(Eval eval, String message) {
+        Matcher m = Pattern.compile("\\{([^}]*)}").matcher(message);
+        StringBuilder out = new StringBuilder();
+        while (m.find()) {
+            String text;
+            try {
+                text = eval.text(eval.eval(m.group(1)));
+            } catch (Eval.Failure e) {
+                text = "{" + e.getMessage() + "}";
+            }
+            m.appendReplacement(out, Matcher.quoteReplacement(text));
+        }
+        return m.appendTail(out).toString();
+    }
+
     private synchronized void stopped(ThreadReference thread, String reason, String description) {
         handles.clear();
+        lastStopped = thread;
         StoppedEventArguments event = new StoppedEventArguments();
         event.setReason(reason);
         event.setThreadId((int) thread.uniqueID());
@@ -339,18 +479,16 @@ final class Debug implements IDebugProtocolServer {
     @Override
     public synchronized CompletableFuture<SetBreakpointsResponse> setBreakpoints(SetBreakpointsArguments args) {
         Path file = Path.of(args.getSource().getPath()).toAbsolutePath().normalize();
-        List<Integer> wanted = new ArrayList<>();
-        for (SourceBreakpoint b : args.getBreakpoints()) wanted.add(b.getLine());
+        List<Wanted> wanted = new ArrayList<>();
+        for (SourceBreakpoint b : args.getBreakpoints()) {
+            wanted.add(new Wanted(
+                    nextBreakpoint++, b.getLine(), b.getCondition(), b.getHitCondition(), b.getLogMessage()));
+        }
         breakpoints.put(file, wanted);
-        if (attached.isDone() && !attached.isCompletedExceptionally()) place(file);
+        if (attached.isDone() && !attached.isCompletedExceptionally()) place(file, false);
 
         List<Breakpoint> result = new ArrayList<>();
-        for (int line : wanted) {
-            Breakpoint breakpoint = new Breakpoint();
-            breakpoint.setLine(line);
-            breakpoint.setVerified(lines == null || target(file, line) != null);
-            result.add(breakpoint);
-        }
+        for (Wanted w : wanted) result.add(breakpoint(w, file));
         SetBreakpointsResponse response = new SetBreakpointsResponse();
         response.setBreakpoints(result.toArray(Breakpoint[]::new));
         return CompletableFuture.completedFuture(response);
@@ -372,16 +510,29 @@ final class Debug implements IDebugProtocolServer {
         } catch (AbsentInformationException e) {
             return;
         }
-        for (Path file : breakpoints.keySet()) place(file);
+        for (Path file : breakpoints.keySet()) place(file, true);
     }
 
-    private void place(Path file) {
+    private Breakpoint breakpoint(Wanted wanted, Path file) {
+        Breakpoint breakpoint = new Breakpoint();
+        breakpoint.setId(wanted.id());
+        breakpoint.setLine(placedLines.getOrDefault(wanted.id(), wanted.line()));
+        breakpoint.setVerified(lines == null || target(file, wanted.line()) != null);
+        Source source = new Source();
+        source.setPath(file.toString());
+        breakpoint.setSource(source);
+        return breakpoint;
+    }
+
+    // tell: the editor already has these, update it where they moved
+    private void place(Path file, boolean tell) {
         VirtualMachine vm = attached.join();
         EventRequestManager manager = vm.eventRequestManager();
         List<BreakpointRequest> old = requests.remove(file);
         if (old != null) manager.deleteEventRequests(old);
         List<BreakpointRequest> placed = new ArrayList<>();
-        for (int line : breakpoints.get(file)) {
+        for (Wanted wanted : breakpoints.get(file)) {
+            int line = wanted.line();
             Target target = target(file, line);
             if (target == null) continue;
             for (ReferenceType type : loaded.getOrDefault(target.source(), List.of())) {
@@ -396,8 +547,19 @@ final class Debug implements IDebugProtocolServer {
                     if (locations.isEmpty()) continue;
                     BreakpointRequest request = manager.createBreakpointRequest(locations.getFirst());
                     request.setSuspendPolicy(EventRequest.SUSPEND_ALL);
+                    request.putProperty("wanted", wanted);
                     request.enable();
                     placed.add(request);
+                    Lines.Spot spot = spot(locations.getFirst());
+                    if (spot != null && spot.line() != placedLines.getOrDefault(wanted.id(), line)) {
+                        placedLines.put(wanted.id(), spot.line());
+                        if (tell) {
+                            BreakpointEventArguments moved = new BreakpointEventArguments();
+                            moved.setReason(BreakpointEventArgumentsReason.CHANGED);
+                            moved.setBreakpoint(breakpoint(wanted, file));
+                            client.breakpoint(moved);
+                        }
+                    }
                     break;
                 }
             }
@@ -409,6 +571,7 @@ final class Debug implements IDebugProtocolServer {
     public synchronized CompletableFuture<SetExceptionBreakpointsResponse> setExceptionBreakpoints(
             SetExceptionBreakpointsArguments args) {
         uncaught = List.of(args.getFilters()).contains("uncaught");
+        caught = List.of(args.getFilters()).contains("caught");
         if (attached.isDone() && !attached.isCompletedExceptionally()) setExceptions(attached.join());
         return CompletableFuture.completedFuture(new SetExceptionBreakpointsResponse());
     }
@@ -416,8 +579,8 @@ final class Debug implements IDebugProtocolServer {
     private void setExceptions(VirtualMachine vm) {
         if (exceptions != null) vm.eventRequestManager().deleteEventRequest(exceptions);
         exceptions = null;
-        if (!uncaught) return;
-        exceptions = vm.eventRequestManager().createExceptionRequest(null, false, true);
+        if (!uncaught && !caught) return;
+        exceptions = vm.eventRequestManager().createExceptionRequest(null, caught, uncaught);
         exceptions.setSuspendPolicy(EventRequest.SUSPEND_ALL);
         exceptions.enable();
     }
@@ -538,9 +701,17 @@ final class Debug implements IDebugProtocolServer {
                     frame.setSource(source);
                     frame.setLine(spot.line());
                 } else {
-                    // Library code
+                    // Processing's and Java's own, opened from the bundled sources
                     frame.setPresentationHint(StackFramePresentationHint.SUBTLE);
-                    frame.setLine(0);
+                    Path file = Sources.file(type);
+                    if (file != null && location.lineNumber() > 0) {
+                        Source source = new Source();
+                        source.setName(file.getFileName().toString());
+                        source.setPath(file.toString());
+                        source.setPresentationHint(SourcePresentationHint.DEEMPHASIZE);
+                        frame.setSource(source);
+                    }
+                    frame.setLine(Math.max(location.lineNumber(), 0));
                 }
                 frame.setColumn(0);
                 frames.add(frame);
@@ -672,11 +843,22 @@ final class Debug implements IDebugProtocolServer {
         return switch (value) {
             case null -> "null";
             case StringReference s -> "\"" + s.value() + "\"";
-            case CharValue c -> "'" + c.value() + "'";
+            case CharValue c -> "'" + escaped(c.value()) + "'";
             case PrimitiveValue p -> p.toString();
             case ArrayReference a -> shortType(a.type().name()).replaceFirst("\\[]", "[" + a.length() + "]");
             case ObjectReference o -> summary(o);
             default -> value.toString();
+        };
+    }
+
+    // key starts as 0, which a raw character would garble
+    private static String escaped(char c) {
+        return switch (c) {
+            case 0 -> "\\0";
+            case '\n' -> "\\n";
+            case '\t' -> "\\t";
+            case '\r' -> "\\r";
+            default -> c < 0x20 || c == 0x7f ? String.format("\\u%04x", (int) c) : String.valueOf(c);
         };
     }
 
@@ -711,50 +893,131 @@ final class Debug implements IDebugProtocolServer {
         return id;
     }
 
-    // Like ball.pos.x or balls[0]
     @Override
     public synchronized CompletableFuture<EvaluateResponse> evaluate(EvaluateArguments args) {
-        Value value = null;
-        boolean found = false;
-        if (args.getFrameId() != null && handles.get(args.getFrameId()) instanceof FrameHandle handle) {
-            String[] parts = args.getExpression().strip().split("\\.|(?=\\[)");
-            StackFrame frame = frame(handle);
-            try {
-                LocalVariable local = frame.visibleVariableByName(parts[0]);
-                if (local != null) {
-                    value = frame.getValue(local);
-                    found = true;
+        if (args.getFrameId() == null || !(handles.get(args.getFrameId()) instanceof FrameHandle handle)) {
+            return failed("Pause the sketch first");
+        }
+        try {
+            Value value = new Eval(handle.thread(), handle.index(), lines.className).eval(args.getExpression());
+            EvaluateResponse response = new EvaluateResponse();
+            response.setResult(describe(value));
+            if (value != null) response.setType(shortType(value.type().name()));
+            response.setVariablesReference(expandable(value) ? handle(children(value)) : 0);
+            return CompletableFuture.completedFuture(response);
+        } catch (Eval.Failure e) {
+            return failed(e.getMessage());
+        }
+    }
+
+    private static <T> CompletableFuture<T> failed(String message) {
+        return CompletableFuture.failedFuture(
+                new ResponseErrorException(new ResponseError(ResponseErrorCode.InvalidParams, message, null)));
+    }
+
+    // From the variables view
+    @Override
+    public synchronized CompletableFuture<SetVariableResponse> setVariable(SetVariableArguments args) {
+        Object container = handles.get(args.getVariablesReference());
+        String name = args.getName();
+        try {
+            Value value;
+            switch (container) {
+                case Locals locals ->
+                    value = new Eval(locals.frame().thread(), locals.frame().index(), lines.className)
+                            .assign(name, args.getValue());
+                case Fields fields -> {
+                    Field field = fields.object().referenceType().fieldByName(name);
+                    if (field == null || lastStopped == null) return failed("Can't set " + name);
+                    Eval eval = new Eval(lastStopped, 0, lines.className);
+                    value = eval.fit(eval.eval(args.getValue()), field.type());
+                    fields.object().setValue(field, value);
                 }
-            } catch (AbsentInformationException ignored) {
-                // No locals
+                case ArrayReference array -> {
+                    if (lastStopped == null) return failed("Can't set " + name);
+                    Eval eval = new Eval(lastStopped, 0, lines.className);
+                    value = eval.fit(
+                            eval.eval(args.getValue()), ((com.sun.jdi.ArrayType) array.type()).componentType());
+                    array.setValue(Integer.parseInt(name.replaceAll("[\\[\\]]", "")), value);
+                }
+                case null, default -> {
+                    return failed("Can't set " + name);
+                }
             }
-            for (ObjectReference self = frame.thisObject(); !found && self != null; self = outer(self)) {
-                Field field = self.referenceType().fieldByName(parts[0]);
-                if (field != null) {
-                    value = self.getValue(field);
-                    found = true;
-                }
-                if (isSketch(self)) break;
-            }
-            for (int i = 1; found && i < parts.length; i++) {
-                String part = parts[i];
-                if (part.startsWith("[") && value instanceof ArrayReference array) {
-                    int index = Integer.parseInt(
-                            part.substring(1, part.indexOf(']')).strip());
-                    value = index < array.length() ? array.getValue(index) : null;
-                    found = index < array.length();
-                } else if (value instanceof ObjectReference object
-                        && object.referenceType().fieldByName(part) instanceof Field field) {
-                    value = object.getValue(field);
-                } else {
-                    found = false;
-                }
+            SetVariableResponse response = new SetVariableResponse();
+            response.setValue(describe(value));
+            if (value != null) response.setType(shortType(value.type().name()));
+            response.setVariablesReference(expandable(value) ? handle(children(value)) : 0);
+            return CompletableFuture.completedFuture(response);
+        } catch (Eval.Failure e) {
+            return failed(e.getMessage());
+        } catch (Exception e) {
+            return failed("Can't set " + name + ": " + e.getMessage());
+        }
+    }
+
+    @Override
+    public synchronized CompletableFuture<ExceptionInfoResponse> exceptionInfo(ExceptionInfoArguments args) {
+        ObjectReference exception = thrown.get((long) args.getThreadId());
+        if (exception == null) {
+            for (ThreadReference t : attached.join().allThreads()) {
+                if ((int) t.uniqueID() == args.getThreadId()) exception = thrown.get(t.uniqueID());
             }
         }
-        if (!found) return CompletableFuture.failedFuture(new IllegalArgumentException("Not available"));
-        EvaluateResponse response = new EvaluateResponse();
-        response.setResult(describe(value));
-        response.setVariablesReference(expandable(value) ? handle(children(value)) : 0);
+        if (exception == null) return failed("No exception");
+        ExceptionInfoResponse response = new ExceptionInfoResponse();
+        response.setExceptionId(exception.referenceType().name());
+        Field message = exception.referenceType().fieldByName("detailMessage");
+        Value text = message == null ? null : exception.getValue(message);
+        response.setDescription(
+                text instanceof StringReference s
+                        ? s.value()
+                        : shortType(exception.referenceType().name()));
+        response.setBreakMode(caught ? ExceptionBreakMode.ALWAYS : ExceptionBreakMode.UNHANDLED);
+        return CompletableFuture.completedFuture(response);
+    }
+
+    // Break when a field of an object changes
+    @Override
+    public synchronized CompletableFuture<DataBreakpointInfoResponse> dataBreakpointInfo(
+            DataBreakpointInfoArguments args) {
+        DataBreakpointInfoResponse response = new DataBreakpointInfoResponse();
+        Object container = args.getVariablesReference() == null ? null : handles.get(args.getVariablesReference());
+        if (container instanceof Fields fields
+                && fields.object().referenceType().fieldByName(args.getName()) instanceof Field field) {
+            String id = fields.object().uniqueID() + ":" + field.name();
+            watchable.put(id, new Watched(fields.object(), field));
+            response.setDataId(id);
+            response.setDescription(args.getName() + " changes");
+            response.setAccessTypes(new DataBreakpointAccessType[] {DataBreakpointAccessType.WRITE});
+        } else {
+            response.setDescription("Only fields can be watched");
+        }
+        return CompletableFuture.completedFuture(response);
+    }
+
+    @Override
+    public synchronized CompletableFuture<SetDataBreakpointsResponse> setDataBreakpoints(
+            SetDataBreakpointsArguments args) {
+        EventRequestManager manager = attached.join().eventRequestManager();
+        manager.deleteEventRequests(watchpoints);
+        watchpoints.clear();
+        List<Breakpoint> result = new ArrayList<>();
+        for (DataBreakpoint wanted : args.getBreakpoints()) {
+            Watched watched = watchable.get(wanted.getDataId());
+            Breakpoint breakpoint = new Breakpoint();
+            breakpoint.setVerified(watched != null);
+            if (watched != null) {
+                ModificationWatchpointRequest request = manager.createModificationWatchpointRequest(watched.field());
+                request.addInstanceFilter(watched.object());
+                request.setSuspendPolicy(EventRequest.SUSPEND_ALL);
+                request.enable();
+                watchpoints.add(request);
+            }
+            result.add(breakpoint);
+        }
+        SetDataBreakpointsResponse response = new SetDataBreakpointsResponse();
+        response.setBreakpoints(result.toArray(Breakpoint[]::new));
         return CompletableFuture.completedFuture(response);
     }
 
@@ -820,6 +1083,24 @@ final class Debug implements IDebugProtocolServer {
             return new Spot(
                     tab.file(),
                     lineOf(tab.text(), Math.min(input - tab.start(), tab.text().length())) + 1);
+        }
+
+        record Place(Path file, int line, int column, String text) {}
+
+        // Tab, line, column and line text for a Java offset
+        Place place(long javaOffset) {
+            int input = mapper.getInputOffset((int) Math.max(0, Math.min(javaOffset, java.length())));
+            Tab tab = tabs.getFirst();
+            for (Tab t : tabs) if (t.start() <= input) tab = t;
+            String text = tab.text();
+            int local = Math.max(0, Math.min(input - tab.start(), text.length()));
+            int start = text.lastIndexOf('\n', local - 1) + 1;
+            int end = text.indexOf('\n', local);
+            return new Place(
+                    tab.file(),
+                    lineOf(text, local) + 1,
+                    local - start + 1,
+                    text.substring(start, end < 0 ? text.length() : end));
         }
 
         private static int lineStart(String text, int line) {

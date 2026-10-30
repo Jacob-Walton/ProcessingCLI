@@ -126,6 +126,13 @@ final class Sources {
     }
 
     // Read-only, editing it would do nothing
+    // Source of a compiled class, like java.util.ArrayList$Itr
+    static Path file(String className) {
+        int nested = className.indexOf('$');
+        String top = nested < 0 ? className : className.substring(0, nested);
+        return unpack(top.replace('.', '/') + ".java");
+    }
+
     private static synchronized Path unpack(String entry) {
         Path file = Runner.cacheRoot().resolve("sources").resolve(entry);
         if (Files.isRegularFile(file)) return file;

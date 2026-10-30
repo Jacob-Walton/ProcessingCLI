@@ -89,15 +89,6 @@ public class Main implements Callable<Integer> {
             return;
         }
 
-        // Warm up AWT + Processing
-        Thread.ofPlatform().daemon().start(() -> {
-            try {
-                java.awt.Toolkit.getDefaultToolkit();
-                Class.forName("processing.core.PApplet");
-            } catch (Throwable ignored) {
-            }
-        });
-
         Main app = new Main();
         int code = new CommandLine(app).execute(args);
 
@@ -150,6 +141,18 @@ public class Main implements Callable<Integer> {
         sketch = sketch.toAbsolutePath().normalize();
 
         Runner.cleanUpInBackground();
+        // Preview window is hidden, no Dock icon
+        if (preview != null) System.setProperty("apple.awt.UIElement", "true");
+        // Warm up AWT + Processing, only for sketches (Dock icon on macOS)
+        if (!emitJava && !export) {
+            Thread.ofPlatform().daemon().start(() -> {
+                try {
+                    java.awt.Toolkit.getDefaultToolkit();
+                    Class.forName("processing.core.PApplet");
+                } catch (Throwable ignored) {
+                }
+            });
+        }
 
         if (emitJava) {
             Processor processor = new Processor(sketch);
@@ -183,7 +186,7 @@ public class Main implements Callable<Integer> {
                 processor.checkBraces();
                 String code = processor.process(source);
                 Bench.mark("processed");
-                Runner.compile(name, Preview.hideable(code), javaTabs, classes, stamp, libs);
+                Runner.compile(name, Preview.hideable(code), javaTabs, classes, stamp, libs, sketch);
                 Bench.mark("compiled");
             } else {
                 Bench.mark("cache-hit");

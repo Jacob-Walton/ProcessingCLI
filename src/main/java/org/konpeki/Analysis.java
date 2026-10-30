@@ -183,7 +183,13 @@ final class Analysis {
                 .collect(Collectors.joining(File.pathSeparator));
         DiagnosticCollector<JavaFileObject> diagnostics = new DiagnosticCollector<>();
         JavacTask task = (JavacTask) ToolProvider.getSystemJavaCompiler()
-                .getTask(null, files, diagnostics, List.of("-proc:none", "-cp", classpath), null, sources);
+                .getTask(
+                        null,
+                        files,
+                        diagnostics,
+                        List.of("--release", "17", "-proc:none", "-cp", classpath),
+                        null,
+                        sources);
         // By URI, javac wraps the file objects it hands back
         for (CompilationUnitTree parsed : task.parse()) {
             JavaTab tab = javaTabs.stream()
@@ -213,7 +219,7 @@ final class Analysis {
     }
 
     // Drops javac's "location: class Sketch" line, it's always the sketch
-    private static String message(Diagnostic<?> d) {
+    static String message(Diagnostic<?> d) {
         return d.getMessage(Locale.ENGLISH)
                 .lines()
                 .filter(l -> !l.trim().startsWith("location:"))

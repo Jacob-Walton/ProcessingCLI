@@ -20,7 +20,10 @@ import java.util.HexFormat;
 import java.util.List;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+import javax.tools.Diagnostic;
+import javax.tools.DiagnosticCollector;
 import javax.tools.JavaCompiler;
+import javax.tools.JavaFileObject;
 import javax.tools.StandardJavaFileManager;
 import javax.tools.ToolProvider;
 import processing.core.PApplet;
@@ -60,7 +63,13 @@ public class Runner {
     }
 
     public static void compile(
-            String className, String javaSource, List<Path> javaTabs, Path classesDir, String stamp, List<Path> libs)
+            String className,
+            String javaSource,
+            List<Path> javaTabs,
+            Path classesDir,
+            String stamp,
+            List<Path> libs,
+            Path sketchDir)
             throws Exception {
         deleteRecursively(classesDir);
         Files.createDirectories(classesDir);
@@ -79,7 +88,10 @@ public class Runner {
                         libs.stream().map(Path::toString))
                 .collect(Collectors.joining(File.pathSeparator));
 
+        // What Processing itself runs on, so sketches stay compatible with it
         List<String> options = List.of(
+                "--release",
+                "17",
                 "-cp",
                 classpath,
                 "-d",
@@ -91,13 +103,58 @@ public class Runner {
                 // "uses unchecked operations" notes
                 "-XDsuppressNotes");
         List<Path> sources = Stream.concat(Stream.of(file), javaTabs.stream()).toList();
+        DiagnosticCollector<JavaFileObject> diagnostics = new DiagnosticCollector<>();
         boolean compiled = compiler.getTask(
-                        null, files, null, options, null, files.getJavaFileObjectsFromPaths(sources))
+                        null, files, diagnostics, options, null, files.getJavaFileObjectsFromPaths(sources))
                 .call();
         if (!compiled) {
+            report(diagnostics.getDiagnostics(), file, sketchDir);
             throw new IllegalStateException("Sketch failed to compile (see errors above)");
         }
         Files.writeString(classesDir.resolve(".ok"), stamp);
+    }
+
+    // Errors at the tab's line, not the generated file
+    private static void report(List<Diagnostic<? extends JavaFileObject>> diagnostics, Path generated, Path sketchDir) {
+        Debug.Lines lines = null;
+        try {
+            lines = Debug.Lines.of(sketchDir);
+        } catch (Exception ignored) {
+            // javac's positions then
+        }
+        int errors = 0;
+        for (Diagnostic<? extends JavaFileObject> d : diagnostics) {
+            if (d.getKind() == Diagnostic.Kind.NOTE) continue;
+            if (d.getKind() == Diagnostic.Kind.ERROR) errors++;
+            Path source = d.getSource() == null ? null : Path.of(d.getSource().toUri());
+            String where = "", text = null;
+            long column = 0;
+            if (source != null && source.equals(generated) && lines != null && d.getPosition() >= 0) {
+                Debug.Lines.Place place = lines.place(d.getPosition());
+                where = place.file().getFileName() + ":" + place.line() + ": ";
+                text = place.text();
+                column = place.column();
+            } else if (source != null && d.getLineNumber() > 0) {
+                where = source.getFileName() + ":" + d.getLineNumber() + ": ";
+                try {
+                    text = Files.readAllLines(source).get((int) d.getLineNumber() - 1);
+                    column = d.getColumnNumber();
+                } catch (Exception ignored) {
+                    // No line to show
+                }
+            }
+            String[] message = Analysis.message(d).split("\n");
+            String kind = d.getKind() == Diagnostic.Kind.ERROR ? "error" : "warning";
+            System.err.println(where + kind + ": " + message[0]);
+            if (text != null && column > 0) {
+                System.err.println(text);
+                // Keep tabs so ^ lines up
+                String before = text.substring(0, (int) Math.min(column - 1, text.length()));
+                System.err.println(before.replaceAll("[^\t]", " ") + "^");
+            }
+            for (int i = 1; i < message.length; i++) System.err.println(message[i]);
+        }
+        System.err.println(errors + (errors == 1 ? " error" : " errors"));
     }
 
     public static void launch(
