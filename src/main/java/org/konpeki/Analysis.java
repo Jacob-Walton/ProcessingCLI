@@ -285,7 +285,7 @@ final class Analysis {
                 if (offset < 0 || name.isEmpty() || name.equals("this") || name.equals("super")) return;
                 Element element = trees.getElement(getCurrentPath());
                 int type = element == null ? -1 : tokenType(element);
-                if (type < 0) return;
+                if (type < 0 || builtIn(element)) return;
                 Spot spot = scanned == unit ? javaSpot((int) offset) : tabSpot(javaUnits.get(scanned), (int) offset);
                 // size() and co. get moved into settings()
                 if (scanned == unit && !name.equals(textAt(spot, name.length()))) spot = movedSpot((int) offset, file);
@@ -308,6 +308,14 @@ final class Analysis {
             if (last == null || last[0] != token[0] || last[1] != token[1]) unique.add(token);
         }
         return unique;
+    }
+
+    // Grammar colours these
+    private static boolean builtIn(Element element) {
+        return element.getKind() == ElementKind.FIELD
+                && element.getEnclosingElement() instanceof TypeElement owner
+                && (owner.getQualifiedName().contentEquals("processing.core.PApplet")
+                        || owner.getQualifiedName().contentEquals("processing.core.PConstants"));
     }
 
     private static int tokenType(Element element) {

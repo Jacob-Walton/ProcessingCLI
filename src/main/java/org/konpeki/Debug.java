@@ -179,6 +179,9 @@ final class Debug implements IDebugProtocolServer {
 
     private record Fields(ObjectReference object, boolean sketchOnly, boolean processingOnly) {}
 
+    // Array or list contents
+    private record Slice(ArrayReference array, int length) {}
+
     static void run() throws Exception {
         FileOutputStream protocol = new FileOutputStream(FileDescriptor.out);
         System.setOut(System.err);
@@ -328,6 +331,7 @@ final class Debug implements IDebugProtocolServer {
             while (true) {
                 EventSet set = vm.eventQueue().remove();
                 boolean resume = true;
+                List<BreakpointEvent> hits = new ArrayList<>();
                 for (Event event : set) {
                     // Hit while evaluating something, the evaluation is waiting on it
                     if (event instanceof com.sun.jdi.event.LocatableEvent located
@@ -336,10 +340,7 @@ final class Debug implements IDebugProtocolServer {
                     }
                     switch (event) {
                         case ClassPrepareEvent prepare -> prepared(prepare.referenceType());
-                        case BreakpointEvent hit -> {
-                            conditions.execute(() -> hit(hit, set));
-                            resume = false;
-                        }
+                        case BreakpointEvent hit -> hits.add(hit);
                         case ModificationWatchpointEvent changed -> {
                             stopped(
                                     changed.thread(),
@@ -375,7 +376,10 @@ final class Debug implements IDebugProtocolServer {
                         default -> {}
                     }
                 }
-                if (resume) set.resume();
+                // Step already stopped it
+                boolean held = !resume;
+                if (!hits.isEmpty()) conditions.execute(() -> hit(hits, set, held));
+                else if (resume) set.resume();
             }
         } catch (Exception e) {
             ended();
@@ -394,41 +398,44 @@ final class Debug implements IDebugProtocolServer {
     }
 
     // Hit counts, conditions and logpoints decide whether it stops
-    private void hit(BreakpointEvent event, EventSet set) {
+    private void hit(List<BreakpointEvent> events, EventSet set, boolean held) {
+        ThreadReference thread = events.getFirst().thread();
+        boolean stop = false;
+        Eval.evaluating.add(thread);
+        try {
+            for (BreakpointEvent event : events) stop |= stops(event);
+        } finally {
+            Eval.evaluating.remove(thread);
+        }
+        if (held) return;
+        if (stop) stopped(thread, StoppedEventArgumentsReason.BREAKPOINT, null);
+        else set.resume();
+    }
+
+    private boolean stops(BreakpointEvent event) {
         BreakpointRequest request = (BreakpointRequest) event.request();
         Wanted wanted = (Wanted) request.getProperty("wanted");
+        if (wanted == null) return true;
         int count;
         synchronized (this) {
             count = hits.merge(request, 1, Integer::sum);
         }
-        Eval.evaluating.add(event.thread());
+        if (!hitCount(wanted.hitCondition(), count)) return false;
         try {
-            if (wanted != null && !hitCount(wanted.hitCondition(), count)) {
-                set.resume();
-                return;
-            }
             Eval eval = new Eval(event.thread(), 0, lines.className);
-            if (wanted != null
-                    && wanted.condition() != null
-                    && !wanted.condition().isBlank()) {
+            if (wanted.condition() != null && !wanted.condition().isBlank()) {
                 Value result = eval.eval(wanted.condition());
-                if (!(result instanceof com.sun.jdi.BooleanValue b) || !b.value()) {
-                    set.resume();
-                    return;
-                }
+                if (!(result instanceof com.sun.jdi.BooleanValue b) || !b.value()) return false;
             }
-            if (wanted != null && wanted.logMessage() != null) {
+            if (wanted.logMessage() != null) {
                 output(interpolate(eval, wanted.logMessage()) + "\n", OutputEventArgumentsCategory.CONSOLE);
-                set.resume();
-                return;
+                return false;
             }
         } catch (Eval.Failure e) {
             // A broken condition stops, so it can be fixed
             output("Breakpoint condition: " + e.getMessage() + "\n", OutputEventArgumentsCategory.STDERR);
-        } finally {
-            Eval.evaluating.remove(event.thread());
         }
-        stopped(event.thread(), StoppedEventArgumentsReason.BREAKPOINT, null);
+        return true;
     }
 
     // 5, >5, >=5 or %5, like other Java debuggers
@@ -794,7 +801,11 @@ final class Debug implements IDebugProtocolServer {
                 StackFrame frame = frame(locals.frame());
                 try {
                     for (LocalVariable local : frame.visibleVariables()) {
-                        variables.add(variable(local.name(), frame.getValue(local)));
+                        try {
+                            variables.add(variable(local.name(), frame.getValue(local)));
+                        } catch (RuntimeException e) {
+                            variables.add(unavailable(local.name()));
+                        }
                     }
                 } catch (AbsentInformationException e) {
                     // Compiled without -g
@@ -803,17 +814,31 @@ final class Debug implements IDebugProtocolServer {
             case Fields fields -> {
                 ReferenceType type = fields.object().referenceType();
                 for (Field field : type.allFields()) {
-                    if (field.isStatic() || field.isSynthetic()) continue;
+                    if (field.isSynthetic()) continue;
                     boolean declaredBySketch = field.declaringType().name().equals(lines.className);
+                    // Static globals
+                    if (field.isStatic() && !(fields.sketchOnly() && declaredBySketch)) continue;
                     if (fields.sketchOnly() && !declaredBySketch) continue;
                     if (fields.processingOnly() && (declaredBySketch || !PROCESSING.contains(field.name()))) continue;
-                    variables.add(variable(field.name(), fields.object().getValue(field)));
+                    try {
+                        Value value = field.isStatic()
+                                ? type.getValue(field)
+                                : fields.object().getValue(field);
+                        variables.add(variable(field.name(), value));
+                    } catch (RuntimeException e) {
+                        variables.add(unavailable(field.name()));
+                    }
                 }
             }
-            case ArrayReference array -> {
-                int count = Math.min(array.length(), 1000);
-                List<Value> values = array.getValues(0, count);
-                for (int i = 0; i < count; i++) variables.add(variable("[" + i + "]", values.get(i)));
+            case Slice slice -> {
+                int start = args.getStart() == null ? 0 : Math.max(args.getStart(), 0);
+                int count = args.getCount() == null || args.getCount() == 0
+                        ? Math.min(slice.length() - start, 10_000)
+                        : Math.min(args.getCount(), slice.length() - start);
+                if (count > 0) {
+                    List<Value> values = slice.array().getValues(start, count);
+                    for (int i = 0; i < count; i++) variables.add(variable("[" + (start + i) + "]", values.get(i)));
+                }
             }
             case null, default -> {}
         }
@@ -826,29 +851,65 @@ final class Debug implements IDebugProtocolServer {
         Variable variable = new Variable();
         variable.setName(name);
         variable.setValue(describe(value));
-        variable.setVariablesReference(expandable(value) ? handle(children(value)) : 0);
+        Object children = children(value);
+        variable.setVariablesReference(children == null ? 0 : handle(children));
+        if (children instanceof Slice slice) variable.setIndexedVariables(slice.length());
         if (value != null) variable.setType(shortType(value.type().name()));
         return variable;
     }
 
-    private static boolean expandable(Value value) {
-        return value instanceof ObjectReference && !(value instanceof StringReference);
+    private static Variable unavailable(String name) {
+        Variable variable = new Variable();
+        variable.setName(name);
+        variable.setValue("unavailable");
+        return variable;
     }
 
-    private Object children(Value value) {
-        return value instanceof ArrayReference array ? array : new Fields((ObjectReference) value, false, false);
+    private static Object children(Value value) {
+        if (!(value instanceof ObjectReference object) || value instanceof StringReference) return null;
+        Slice slice = slice(object);
+        return slice != null ? slice : new Fields(object, false, false);
+    }
+
+    // ArrayList and Processing lists
+    private static Slice slice(ObjectReference object) {
+        if (object instanceof ArrayReference array) return new Slice(array, array.length());
+        String[] names =
+                switch (object.referenceType().name()) {
+                    case "java.util.ArrayList" -> new String[] {"elementData", "size"};
+                    case "processing.data.IntList", "processing.data.FloatList", "processing.data.StringList" ->
+                        new String[] {"data", "count"};
+                    default -> null;
+                };
+        if (names == null) return null;
+        Field data = object.referenceType().fieldByName(names[0]);
+        Field size = object.referenceType().fieldByName(names[1]);
+        if (data == null || size == null) return null;
+        if (object.getValue(data) instanceof ArrayReference array
+                && object.getValue(size) instanceof com.sun.jdi.IntegerValue count) {
+            return new Slice(array, Math.min(count.value(), array.length()));
+        }
+        return null;
     }
 
     private String describe(Value value) {
         return switch (value) {
             case null -> "null";
-            case StringReference s -> "\"" + s.value() + "\"";
+            case StringReference s -> "\"" + escaped(s.value()) + "\"";
             case CharValue c -> "'" + escaped(c.value()) + "'";
             case PrimitiveValue p -> p.toString();
             case ArrayReference a -> shortType(a.type().name()).replaceFirst("\\[]", "[" + a.length() + "]");
+            case ObjectReference o
+            when slice(o) instanceof Slice list -> shortType(o.referenceType().name()) + " size=" + list.length();
             case ObjectReference o -> summary(o);
             default -> value.toString();
         };
+    }
+
+    private static String escaped(String text) {
+        StringBuilder out = new StringBuilder();
+        for (char c : text.toCharArray()) out.append(c == '"' ? "\\\"" : c == '\\' ? "\\\\" : escaped(c));
+        return out.toString();
     }
 
     // key starts as 0, which a raw character would garble
@@ -903,7 +964,9 @@ final class Debug implements IDebugProtocolServer {
             EvaluateResponse response = new EvaluateResponse();
             response.setResult(describe(value));
             if (value != null) response.setType(shortType(value.type().name()));
-            response.setVariablesReference(expandable(value) ? handle(children(value)) : 0);
+            Object children = children(value);
+            response.setVariablesReference(children == null ? 0 : handle(children));
+            if (children instanceof Slice slice) response.setIndexedVariables(slice.length());
             return CompletableFuture.completedFuture(response);
         } catch (Eval.Failure e) {
             return failed(e.getMessage());
@@ -931,11 +994,13 @@ final class Debug implements IDebugProtocolServer {
                     if (field == null || lastStopped == null) return failed("Can't set " + name);
                     Eval eval = new Eval(lastStopped, 0, lines.className);
                     value = eval.fit(eval.eval(args.getValue()), field.type());
-                    fields.object().setValue(field, value);
+                    if (field.isStatic()) ((com.sun.jdi.ClassType) field.declaringType()).setValue(field, value);
+                    else fields.object().setValue(field, value);
                 }
-                case ArrayReference array -> {
+                case Slice slice -> {
                     if (lastStopped == null) return failed("Can't set " + name);
                     Eval eval = new Eval(lastStopped, 0, lines.className);
+                    ArrayReference array = slice.array();
                     value = eval.fit(
                             eval.eval(args.getValue()), ((com.sun.jdi.ArrayType) array.type()).componentType());
                     array.setValue(Integer.parseInt(name.replaceAll("[\\[\\]]", "")), value);
@@ -947,7 +1012,9 @@ final class Debug implements IDebugProtocolServer {
             SetVariableResponse response = new SetVariableResponse();
             response.setValue(describe(value));
             if (value != null) response.setType(shortType(value.type().name()));
-            response.setVariablesReference(expandable(value) ? handle(children(value)) : 0);
+            Object children = children(value);
+            response.setVariablesReference(children == null ? 0 : handle(children));
+            if (children instanceof Slice slice) response.setIndexedVariables(slice.length());
             return CompletableFuture.completedFuture(response);
         } catch (Eval.Failure e) {
             return failed(e.getMessage());
@@ -999,7 +1066,7 @@ final class Debug implements IDebugProtocolServer {
     @Override
     public synchronized CompletableFuture<SetDataBreakpointsResponse> setDataBreakpoints(
             SetDataBreakpointsArguments args) {
-        // Can come before the sketch attaches
+        // May come before attach
         boolean live = attached.isDone() && !attached.isCompletedExceptionally();
         EventRequestManager manager = live ? attached.join().eventRequestManager() : null;
         if (manager != null) manager.deleteEventRequests(watchpoints);
@@ -1011,7 +1078,7 @@ final class Debug implements IDebugProtocolServer {
             breakpoint.setVerified(watched != null);
             if (watched != null) {
                 ModificationWatchpointRequest request = manager.createModificationWatchpointRequest(watched.field());
-                request.addInstanceFilter(watched.object());
+                if (!watched.field().isStatic()) request.addInstanceFilter(watched.object());
                 request.setSuspendPolicy(EventRequest.SUSPEND_ALL);
                 request.enable();
                 watchpoints.add(request);
