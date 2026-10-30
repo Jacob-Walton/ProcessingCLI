@@ -999,12 +999,14 @@ final class Debug implements IDebugProtocolServer {
     @Override
     public synchronized CompletableFuture<SetDataBreakpointsResponse> setDataBreakpoints(
             SetDataBreakpointsArguments args) {
-        EventRequestManager manager = attached.join().eventRequestManager();
-        manager.deleteEventRequests(watchpoints);
+        // Can come before the sketch attaches
+        boolean live = attached.isDone() && !attached.isCompletedExceptionally();
+        EventRequestManager manager = live ? attached.join().eventRequestManager() : null;
+        if (manager != null) manager.deleteEventRequests(watchpoints);
         watchpoints.clear();
         List<Breakpoint> result = new ArrayList<>();
         for (DataBreakpoint wanted : args.getBreakpoints()) {
-            Watched watched = watchable.get(wanted.getDataId());
+            Watched watched = manager == null ? null : watchable.get(wanted.getDataId());
             Breakpoint breakpoint = new Breakpoint();
             breakpoint.setVerified(watched != null);
             if (watched != null) {
