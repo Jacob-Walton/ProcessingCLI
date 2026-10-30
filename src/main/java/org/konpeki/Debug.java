@@ -240,6 +240,8 @@ final class Debug implements IDebugProtocolServer {
         ProcessBuilder builder = new ProcessBuilder(command);
         builder.environment()
                 .put("JAVA_TOOL_OPTIONS", "-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=127.0.0.1:0");
+        // Set by our own Linux launcher, breaks the child's
+        builder.environment().remove("_JPACKAGE_LAUNCHER");
         debuggee = builder.start();
         // Not left suspended if VS Code goes away without disconnecting
         Runtime.getRuntime().addShutdownHook(new java.lang.Thread(this::stop));
