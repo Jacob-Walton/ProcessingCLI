@@ -193,6 +193,8 @@ tasks.register("packageApp") {
             .map { it.substringBefore('@').trim() }
             .filter { it.isNotEmpty() && !it.startsWith("jdk.incubator") && it != "jdk.jlink" && it != "jdk.jpackage" }
 
+        // Cached code can need the build machine's AVX-512
+        val noAotCode = listOf("-XX:+UnlockDiagnosticVMOptions", "-XX:-AOTAdapterCaching", "-XX:-AOTStubCaching")
         val javaOptions = listOf(
             "-XX:AOTCache=\$APPDIR/processingcli.aot",
             "-Xlog:all=error",
@@ -203,7 +205,7 @@ tasks.register("packageApp") {
             // Invalidates compiled sketch caches from older builds
             "-Dprocessingcli.build=${System.currentTimeMillis()}",
             "-Dprocessingcli.version=$fullVersion",
-        ) + jogl
+        ) + noAotCode + jogl
         exec.exec {
             commandLine(listOfNotNull(
                 "$jdk/bin/jpackage",
@@ -249,7 +251,7 @@ tasks.register("packageApp") {
                 "-Xlog:all=error",
                 "--enable-native-access=ALL-UNNAMED",
                 "-Djava.library.path=" + natives.absolutePath,
-            ) + jogl + listOf(
+            ) + noAotCode + jogl + listOf(
                 "-cp", appJar.absolutePath,
                 "org.konpeki.Main",
                 "--bench",
