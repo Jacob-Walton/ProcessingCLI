@@ -230,7 +230,7 @@ final class Analysis {
     // Semantic token legend, the indexes below refer to these
     static final List<String> TOKEN_TYPES = List.of(
             "class", "interface", "enum", "typeParameter", "parameter", "variable", "property", "enumMember", "method");
-    static final List<String> TOKEN_MODIFIERS = List.of("declaration", "static", "readonly");
+    static final List<String> TOKEN_MODIFIERS = List.of("declaration", "static", "readonly", "defaultLibrary");
 
     boolean analysed() {
         return unit != null;
@@ -285,7 +285,9 @@ final class Analysis {
                 if (offset < 0 || name.isEmpty() || name.equals("this") || name.equals("super")) return;
                 Element element = trees.getElement(getCurrentPath());
                 int type = element == null ? -1 : tokenType(element);
-                if (type < 0 || builtIn(element)) return;
+                if (type < 0) return;
+                // Built-ins as defaultLibrary variables
+                if (builtIn(element)) type = 5;
                 Spot spot = scanned == unit ? javaSpot((int) offset) : tabSpot(javaUnits.get(scanned), (int) offset);
                 // size() and co. get moved into settings()
                 if (scanned == unit && !name.equals(textAt(spot, name.length()))) spot = movedSpot((int) offset, file);
@@ -296,7 +298,8 @@ final class Analysis {
                         | (element.getModifiers().contains(Modifier.FINAL)
                                         && element.getKind().isVariable()
                                 ? 4
-                                : 0);
+                                : 0)
+                        | (builtIn(element) ? 8 : 0);
                 tokens.add(new int[] {spot.line(), spot.column(), name.length(), type, modifiers});
             }
         }.scan(target, null);
@@ -310,7 +313,7 @@ final class Analysis {
         return unique;
     }
 
-    // Grammar colours these
+    // width, mouseX, PI and co.
     private static boolean builtIn(Element element) {
         return element.getKind() == ElementKind.FIELD
                 && element.getEnclosingElement() instanceof TypeElement owner
