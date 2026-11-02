@@ -4,10 +4,12 @@ import com.sun.jdi.AbsentInformationException;
 import com.sun.jdi.ArrayReference;
 import com.sun.jdi.Bootstrap;
 import com.sun.jdi.CharValue;
+import com.sun.jdi.ClassType;
 import com.sun.jdi.Field;
 import com.sun.jdi.IncompatibleThreadStateException;
 import com.sun.jdi.LocalVariable;
 import com.sun.jdi.Location;
+import com.sun.jdi.Method;
 import com.sun.jdi.ObjectReference;
 import com.sun.jdi.PrimitiveValue;
 import com.sun.jdi.ReferenceType;
@@ -588,36 +590,65 @@ final class Debug implements IDebugProtocolServer {
             int line = wanted.line();
             Target target = target(file, line);
             if (target == null) continue;
-            for (ReferenceType type : loaded.getOrDefault(target.source(), List.of())) {
-                // Blank lines break on the next code
-                for (int l = target.line(); l < target.line() + 5; l++) {
-                    List<Location> locations;
-                    try {
-                        locations = type.locationsOfLine(l);
-                    } catch (AbsentInformationException e) {
+            List<ReferenceType> types = loaded.getOrDefault(target.source(), List.of());
+            // Exact line first, classes share line numbers
+            List<Location> found = new ArrayList<>();
+            for (ReferenceType type : types) {
+                List<Location> exact = locations(type, target.line());
+                if (!exact.isEmpty()) found.add(exact.getFirst());
+            }
+            // Blank lines break on the next code in the same method
+            if (found.isEmpty()) {
+                for (ReferenceType type : types) {
+                    for (int l = target.line() + 1; l < target.line() + 5; l++) {
+                        List<Location> next = locations(type, l).stream()
+                                .filter(at -> covers(at.method(), target.line()))
+                                .toList();
+                        if (next.isEmpty()) continue;
+                        found.add(next.getFirst());
                         break;
                     }
-                    if (locations.isEmpty()) continue;
-                    BreakpointRequest request = manager.createBreakpointRequest(locations.getFirst());
-                    request.setSuspendPolicy(EventRequest.SUSPEND_ALL);
-                    request.putProperty("wanted", wanted);
-                    request.enable();
-                    placed.add(request);
-                    Lines.Spot spot = spot(locations.getFirst());
-                    if (spot != null && spot.line() != placedLines.getOrDefault(wanted.id(), line)) {
-                        placedLines.put(wanted.id(), spot.line());
-                        if (tell) {
-                            BreakpointEventArguments moved = new BreakpointEventArguments();
-                            moved.setReason(BreakpointEventArgumentsReason.CHANGED);
-                            moved.setBreakpoint(breakpoint(wanted, file));
-                            client.breakpoint(moved);
-                        }
-                    }
-                    break;
+                }
+            }
+            for (Location location : found) {
+                BreakpointRequest request = manager.createBreakpointRequest(location);
+                request.setSuspendPolicy(EventRequest.SUSPEND_ALL);
+                request.putProperty("wanted", wanted);
+                request.enable();
+                placed.add(request);
+            }
+            Lines.Spot spot = found.isEmpty() ? null : spot(found.getFirst());
+            if (spot != null && spot.line() != placedLines.getOrDefault(wanted.id(), line)) {
+                placedLines.put(wanted.id(), spot.line());
+                if (tell) {
+                    BreakpointEventArguments moved = new BreakpointEventArguments();
+                    moved.setReason(BreakpointEventArgumentsReason.CHANGED);
+                    moved.setBreakpoint(breakpoint(wanted, file));
+                    client.breakpoint(moved);
                 }
             }
         }
         requests.put(file, placed);
+    }
+
+    private static List<Location> locations(ReferenceType type, int line) {
+        try {
+            return type.locationsOfLine(line);
+        } catch (AbsentInformationException e) {
+            return List.of();
+        }
+    }
+
+    // In the method, or its signature just above
+    private static boolean covers(Method method, int line) {
+        try {
+            List<Location> all = method.allLineLocations();
+            int first = all.stream().mapToInt(Location::lineNumber).min().orElse(-1);
+            int last = all.stream().mapToInt(Location::lineNumber).max().orElse(-1);
+            return line >= first - 4 && line <= last;
+        } catch (AbsentInformationException e) {
+            return false;
+        }
     }
 
     @Override
@@ -742,15 +773,12 @@ final class Debug implements IDebugProtocolServer {
             List<StackFrame> stack = thread.frames();
             for (int i = 0; i < stack.size(); i++) {
                 Location location = stack.get(i).location();
+                // Written by javac for generics
+                if (location.method().isBridge()) continue;
                 org.eclipse.lsp4j.debug.StackFrame frame = new org.eclipse.lsp4j.debug.StackFrame();
                 frame.setId(handle(new FrameHandle(thread, i)));
                 String type = location.declaringType().name();
-                String method = location.method().name();
-                frame.setName(
-                        type.equals(lines.className)
-                                ? method
-                                : type.substring(type.lastIndexOf('.') + 1).replace(lines.className + "$", "") + "."
-                                        + method);
+                frame.setName(frameName(location));
                 Lines.Spot spot = spot(location);
                 if (spot != null) {
                     Source source = new Source();
@@ -943,6 +971,45 @@ final class Debug implements IDebugProtocolServer {
         return null;
     }
 
+    // new Ball(), static Mode, lambda in setup
+    private String frameName(Location location) {
+        ReferenceType type = location.declaringType();
+        String method = location.method().name();
+        boolean sketch = type.name().equals(lines.className);
+        String name = typeName(type);
+        Matcher lambda = Pattern.compile("lambda\\$(\\w+?)\\$\\d+").matcher(method);
+        return switch (method) {
+            case "<init>" -> sketch ? "globals" : "new " + name + "()";
+            case "<clinit>" -> sketch ? "globals" : "static " + name;
+            default -> {
+                if (lambda.matches()) method = "lambda in " + lambda.group(1);
+                yield sketch ? method : name + "." + method;
+            }
+        };
+    }
+
+    // Anonymous ones by what they extend
+    private String typeName(ReferenceType type) {
+        if (type instanceof ClassType c
+                && type.name().startsWith(lines.className + "$")
+                && type.name().matches(".*\\$\\d+")) {
+            ReferenceType base =
+                    c.interfaces().isEmpty() ? c.superclass() : c.interfaces().getFirst();
+            if (base != null) return "anonymous " + shortType(base.name());
+        }
+        return shortType(type.name());
+    }
+
+    private static final Set<String> BOXES = Set.of(
+            "java.lang.Integer",
+            "java.lang.Long",
+            "java.lang.Short",
+            "java.lang.Byte",
+            "java.lang.Character",
+            "java.lang.Boolean",
+            "java.lang.Float",
+            "java.lang.Double");
+
     private String describe(Value value) {
         return switch (value) {
             case null -> "null";
@@ -952,6 +1019,8 @@ final class Debug implements IDebugProtocolServer {
             case ArrayReference a -> shortType(a.type().name()).replaceFirst("\\[]", "[" + a.length() + "]");
             case ObjectReference o
             when slice(o) instanceof Slice list -> shortType(o.referenceType().name()) + " size=" + list.length();
+            case ObjectReference o
+            when o.referenceType() instanceof ClassType c && c.isEnum() && enumName(o) != null -> enumName(o);
             case ObjectReference o -> summary(o);
             default -> value.toString();
         };
@@ -974,14 +1043,21 @@ final class Debug implements IDebugProtocolServer {
         };
     }
 
+    private static String enumName(ObjectReference constant) {
+        Field name = constant.referenceType().fieldByName("name");
+        return name != null && constant.getValue(name) instanceof StringReference s ? s.value() : null;
+    }
+
     // Like PVector(x=1.0, y=2.0, z=0.0)
     private String summary(ObjectReference object) {
-        String type = shortType(object.referenceType().name());
+        String type = typeName(object.referenceType());
         List<String> parts = new ArrayList<>();
         for (Field field : object.referenceType().allFields()) {
             if (field.isStatic() || field.isSynthetic()) continue;
             Value value = object.getValue(field);
-            if (!(value instanceof PrimitiveValue || value instanceof StringReference)) continue;
+            boolean boxed = value instanceof ObjectReference o
+                    && BOXES.contains(o.referenceType().name());
+            if (!(value instanceof PrimitiveValue || value instanceof StringReference || boxed)) continue;
             if (object.referenceType().name().startsWith("java.lang.")
                     && field.name().equals("value")) {
                 return describe(value);
@@ -996,7 +1072,9 @@ final class Debug implements IDebugProtocolServer {
     }
 
     private String shortType(String name) {
-        return name.substring(name.lastIndexOf('.') + 1).replace(lines.className + "$", "");
+        return name.substring(name.lastIndexOf('.') + 1)
+                .replace(lines.className + "$", "")
+                .replace('$', '.');
     }
 
     private int handle(Object target) {

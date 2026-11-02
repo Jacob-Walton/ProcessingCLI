@@ -37,6 +37,7 @@ import org.eclipse.lsp4j.CompletionParams;
 import org.eclipse.lsp4j.DefinitionParams;
 import org.eclipse.lsp4j.Diagnostic;
 import org.eclipse.lsp4j.DiagnosticSeverity;
+import org.eclipse.lsp4j.DiagnosticTag;
 import org.eclipse.lsp4j.DidChangeConfigurationParams;
 import org.eclipse.lsp4j.DidChangeTextDocumentParams;
 import org.eclipse.lsp4j.DidChangeWatchedFilesParams;
@@ -685,6 +686,7 @@ final class Lsp implements LanguageServer, LanguageClientAware, TextDocumentServ
                     problem.message(),
                     problem.error() ? DiagnosticSeverity.Error : DiagnosticSeverity.Warning,
                     "processing");
+            if (problem.unused()) diagnostic.setTags(List.of(DiagnosticTag.Unnecessary));
             byFile.computeIfAbsent(problem.start().file(), f -> new ArrayList<>())
                     .add(diagnostic);
         }

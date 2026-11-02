@@ -18,7 +18,10 @@ import processing.utils.SketchException;
         mixinStandardHelpOptions = true,
         versionProvider = Main.Version.class,
         description = "Preprocesses, compiles, and runs a Processing sketch.",
-        footer = "%nTo format sketches: ProcessingCLI format [--check] FILE|SKETCH...")
+        footer = {
+            "%nTo format sketches: ProcessingCLI format [--check] FILE|SKETCH...",
+            "To check sketches for likely mistakes: ProcessingCLI lint SKETCH..."
+        })
 public class Main implements Callable<Integer> {
 
     // Set by packageApp
@@ -83,6 +86,9 @@ public class Main implements Callable<Integer> {
         }
         if (args.length > 0 && args[0].equals("format")) {
             System.exit(Format.run(List.of(args).subList(1, args.length)));
+        }
+        if (args.length > 0 && args[0].equals("lint")) {
+            System.exit(Lint.run(List.of(args).subList(1, args.length)));
         }
         if (args.length > 0 && args[0].equals("lsp")) {
             Lsp.run();

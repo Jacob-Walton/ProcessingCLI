@@ -62,7 +62,11 @@ final class Analysis {
     // Lines and columns are 0-based, like LSP positions
     record Spot(Path file, int line, int column) {}
 
-    record Problem(Spot start, Spot end, String message, boolean error) {}
+    record Problem(Spot start, Spot end, String message, boolean error, boolean unused) {
+        Problem(Spot start, Spot end, String message, boolean error) {
+            this(start, end, message, error, false);
+        }
+    }
 
     private record Tab(Path file, int start, String text, int[] lineStarts) {}
 
@@ -187,7 +191,7 @@ final class Analysis {
                         null,
                         files,
                         diagnostics,
-                        List.of("--release", "17", "-proc:none", "-cp", classpath),
+                        List.of("--release", "17", "-proc:none", "-cp", classpath, LINT),
                         null,
                         sources);
         // By URI, javac wraps the file objects it hands back
@@ -216,6 +220,49 @@ final class Analysis {
                     message(d),
                     d.getKind() == Diagnostic.Kind.ERROR));
         }
+        if (problems.stream().noneMatch(Problem::error)) lint();
+    }
+
+    // Minus the noisy ones
+    private static final String LINT = "-Xlint:all,-rawtypes,-unchecked,-serial,-empty,-path,-classfile,-options"
+            + ",-processing,-this-escape,-dangling-doc-comments,-missing-explicit-ctor";
+
+    private void lint() {
+        List<CompilationUnitTree> units = new ArrayList<>(List.of(unit));
+        units.addAll(javaUnits.keySet());
+        for (Lint.Finding finding : Lint.check(units, trees, types, elements, className)) {
+            JavaTab tab = javaUnits.get(finding.unit());
+            Spot start = tab == null ? javaSpot(finding.start()) : tabSpot(tab, finding.start());
+            Spot end = tab == null ? javaSpot(finding.end()) : tabSpot(tab, finding.end());
+            if (tab == null && !written(start, finding.text())) {
+                // The preprocessor moves imports to the top
+                start = finding.text().startsWith("import ") ? moved(finding.text()) : null;
+                if (start == null) continue;
+                end = new Spot(
+                        start.file(),
+                        start.line(),
+                        start.column() + finding.text().length());
+            }
+            Problem problem = new Problem(start, end, finding.message(), false, finding.unused());
+            if (!problems.contains(problem)) problems.add(problem);
+        }
+    }
+
+    private Spot moved(String text) {
+        for (Tab tab : tabs) {
+            int at = tab.text.indexOf(text);
+            if (at >= 0) return combinedSpot(tab.start + at);
+        }
+        return null;
+    }
+
+    // Not something the preprocessor added
+    private boolean written(Spot spot, String text) {
+        for (Tab tab : tabs) {
+            if (!tab.file.equals(spot.file()) || spot.line() >= tab.lineStarts.length) continue;
+            return tab.text.startsWith(text, tab.lineStarts[spot.line()] + spot.column());
+        }
+        return false;
     }
 
     // Drops javac's "location: class Sketch" line, it's always the sketch
@@ -458,6 +505,15 @@ final class Analysis {
     Spot definition(Path file, int line, int column) {
         Element element = elementAt(file, line, column);
         if (element == null) return null;
+        // A record's accessor, its component then
+        if (trees.getPath(element) == null
+                && element.getKind() == ElementKind.METHOD
+                && element.getEnclosingElement() instanceof TypeElement record
+                && record.getKind() == ElementKind.RECORD) {
+            for (Element field : ElementFilter.fieldsIn(record.getEnclosedElements())) {
+                if (field.getSimpleName().equals(element.getSimpleName())) element = field;
+            }
+        }
         TreePath declaration = trees.getPath(element);
         // Compiled code
         if (declaration == null) return Sources.locate(element);
@@ -641,7 +697,7 @@ final class Analysis {
     }
 
     // Processing calls these on the sketch
-    private static final Set<String> CALLBACKS = Set.of(
+    static final Set<String> CALLBACKS = Set.of(
             "settings",
             "setup",
             "draw",
@@ -811,6 +867,11 @@ final class Analysis {
             names.computeIfAbsent(name, k -> new ArrayList<>()).add(e);
             return;
         }
+        // Records are read through their accessors
+        if (owner.getKind() == ElementKind.RECORD
+                && kind == ElementKind.FIELD
+                && !e.getModifiers().contains(Modifier.STATIC)) return;
+        if (name.equals("EnumDesc") && owner.getQualifiedName().contentEquals("java.lang.Enum")) return;
         // Written by the preprocessor
         if (owner.getQualifiedName().contentEquals(className) && (name.equals("main") || name.equals("settings")))
             return;
