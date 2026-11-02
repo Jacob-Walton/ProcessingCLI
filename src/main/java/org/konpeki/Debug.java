@@ -59,6 +59,7 @@ import org.eclipse.lsp4j.debug.Capabilities;
 import org.eclipse.lsp4j.debug.ConfigurationDoneArguments;
 import org.eclipse.lsp4j.debug.ContinueArguments;
 import org.eclipse.lsp4j.debug.ContinueResponse;
+import org.eclipse.lsp4j.debug.ContinuedEventArguments;
 import org.eclipse.lsp4j.debug.DataBreakpoint;
 import org.eclipse.lsp4j.debug.DataBreakpointAccessType;
 import org.eclipse.lsp4j.debug.DataBreakpointInfoArguments;
@@ -111,6 +112,7 @@ import org.eclipse.lsp4j.jsonrpc.Launcher;
 import org.eclipse.lsp4j.jsonrpc.ResponseErrorException;
 import org.eclipse.lsp4j.jsonrpc.messages.ResponseError;
 import org.eclipse.lsp4j.jsonrpc.messages.ResponseErrorCode;
+import org.eclipse.lsp4j.jsonrpc.services.JsonRequest;
 import processing.mode.java.preproc.PdePreprocessor;
 import processing.mode.java.preproc.PreprocessorResult;
 import processing.mode.java.preproc.TextTransform;
@@ -168,6 +170,7 @@ final class Debug implements IDebugProtocolServer {
     private final List<ModificationWatchpointRequest> watchpoints = new ArrayList<>();
     private ThreadReference lastStopped;
     private final Map<String, List<ReferenceType>> loaded = new HashMap<>();
+    private final Set<String> watchedSources = new java.util.HashSet<>();
 
     // Cleared on resume
     private final Map<Integer, Object> handles = new HashMap<>();
@@ -224,7 +227,9 @@ final class Debug implements IDebugProtocolServer {
     public CompletableFuture<Void> launch(Map<String, Object> args) {
         return CompletableFuture.runAsync(() -> {
             try {
-                start(Path.of((String) args.get("sketch")).toAbsolutePath().normalize());
+                start(
+                        Path.of((String) args.get("sketch")).toAbsolutePath().normalize(),
+                        args.get("preview") instanceof String preview ? preview : null);
             } catch (Exception e) {
                 attached.completeExceptionally(e);
                 throw new IllegalStateException(e.getMessage(), e);
@@ -232,10 +237,11 @@ final class Debug implements IDebugProtocolServer {
         });
     }
 
-    private void start(Path sketch) throws Exception {
+    private void start(Path sketch, String preview) throws Exception {
         this.sketch = sketch;
         lines = Lines.of(sketch);
         List<String> command = new ArrayList<>(self());
+        if (preview != null) command.add("--preview=" + preview);
         command.add(sketch.toString());
         ProcessBuilder builder = new ProcessBuilder(command);
         builder.environment()
@@ -270,19 +276,57 @@ final class Debug implements IDebugProtocolServer {
         arguments.get("port").setValue(String.valueOf(port));
         VirtualMachine vm = connector.attach(arguments);
 
-        // Breakpoints go in as classes load
-        EventRequestManager manager = vm.eventRequestManager();
-        for (String source : sources()) {
-            ClassPrepareRequest prepare = manager.createClassPrepareRequest();
-            prepare.addSourceNameFilter(source);
-            prepare.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
-            prepare.enable();
-        }
+        watchSources(vm);
         java.lang.Thread.ofPlatform().daemon().start(() -> events(vm));
         synchronized (this) {
             setExceptions(vm);
         }
         attached.complete(vm);
+    }
+
+    // Breakpoints go in as classes load
+    private void watchSources(VirtualMachine vm) throws Exception {
+        for (String source : sources()) {
+            if (!watchedSources.add(source)) continue;
+            ClassPrepareRequest prepare = vm.eventRequestManager().createClassPrepareRequest();
+            prepare.addSourceNameFilter(source);
+            prepare.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
+            prepare.enable();
+        }
+    }
+
+    // Saved while debugging in the preview
+    @JsonRequest
+    public synchronized CompletableFuture<Void> reload() {
+        VirtualMachine vm = attached.join();
+        try {
+            lines = Lines.of(sketch);
+            watchSources(vm);
+        } catch (Exception e) {
+            // Compile error, shown in the preview
+        }
+        // Let the old sketch stop
+        EventRequestManager manager = vm.eventRequestManager();
+        requests.values().forEach(manager::deleteEventRequests);
+        requests.clear();
+        manager.deleteEventRequests(manager.stepRequests());
+        manager.deleteEventRequests(watchpoints);
+        watchpoints.clear();
+        loaded.clear();
+        hits.clear();
+        handles.clear();
+        vm.resume();
+        ContinuedEventArguments continued = new ContinuedEventArguments();
+        continued.setThreadId(lastStopped == null ? 0 : (int) lastStopped.uniqueID());
+        continued.setAllThreadsContinued(true);
+        client.continued(continued);
+        try {
+            debuggee.outputWriter().write("reload\n");
+            debuggee.outputWriter().flush();
+        } catch (java.io.IOException e) {
+            // The sketch ended
+        }
+        return CompletableFuture.completedFuture(null);
     }
 
     // Packaged app, or this JVM when run from a build
@@ -660,6 +704,11 @@ final class Debug implements IDebugProtocolServer {
         // The launcher may run the JVM as a child
         debuggee.descendants().forEach(ProcessHandle::destroyForcibly);
         debuggee.destroyForcibly();
+        // Frees the preview port
+        try {
+            debuggee.waitFor(2, TimeUnit.SECONDS);
+        } catch (InterruptedException ignored) {
+        }
     }
 
     @Override
